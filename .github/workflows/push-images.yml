@@ -1,0 +1,31 @@
+name: Push lab images to ECR
+
+# Manual trigger only. Run it from the Actions tab after terraform apply.
+on:
+  workflow_dispatch:
+
+# Required so the job can request a GitHub OIDC token and exchange it for
+# short-lived AWS credentials. No access keys are stored anywhere.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Assume the lab IAM role through OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Reuses the same script as the local option, so the image list lives in one place.
+      - name: Pull outdated images and push them to ECR
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          PROJECT_NAME: ${{ vars.PROJECT_NAME || 'inspector-lab' }}
+        run: bash scripts/push-images.sh
