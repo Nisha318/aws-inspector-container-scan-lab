@@ -18,8 +18,11 @@ resource "aws_ecr_registry_scanning_configuration" "this" {
   rule {
     scan_frequency = "CONTINUOUS_SCAN"
 
+    # Scoped to the lab's repositories only. A bare "*" would switch every
+    # repository in the registry to continuous Inspector scanning, which also
+    # means billing for images that have nothing to do with this lab.
     repository_filter {
-      filter      = "*"
+      filter      = "${var.project_name}/*"
       filter_type = "WILDCARD"
     }
   }
