@@ -1,3 +1,5 @@
+data "aws_partition" "current" {}
+
 # Inspector report exports require a customer-managed KMS key.
 # The AWS-managed aws/s3 key will not work because its policy cannot be edited.
 
@@ -9,7 +11,7 @@ data "aws_iam_policy_document" "report_key" {
 
     principals {
       type        = "AWS"
-      identifiers = ["arn:aws:iam::${local.account_id}:root"]
+      identifiers = ["arn:${data.aws_partition.current.partition}:iam::${local.account_id}:root"]
     }
   }
 
@@ -32,7 +34,7 @@ data "aws_iam_policy_document" "report_key" {
     condition {
       test     = "ArnLike"
       variable = "aws:SourceArn"
-      values   = ["arn:aws:inspector2:${var.aws_region}:${local.account_id}:report/*"]
+      values   = ["arn:${data.aws_partition.current.partition}:inspector2:${var.aws_region}:${local.account_id}:report/*"]
     }
   }
 }
@@ -94,7 +96,7 @@ data "aws_iam_policy_document" "report_bucket" {
     condition {
       test     = "ArnLike"
       variable = "aws:SourceArn"
-      values   = ["arn:aws:inspector2:${var.aws_region}:${local.account_id}:report/*"]
+      values   = ["arn:${data.aws_partition.current.partition}:inspector2:${var.aws_region}:${local.account_id}:report/*"]
     }
   }
 }

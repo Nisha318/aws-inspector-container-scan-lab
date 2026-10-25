@@ -1,0 +1,51 @@
+name: Export Inspector findings to S3
+
+# Manual trigger only. Run it from the Actions tab after the images have been
+# pushed and Inspector has finished scanning them (a few minutes).
+on:
+  workflow_dispatch:
+    inputs:
+      report_format:
+        description: Report file format
+        type: choice
+        options:
+          - CSV
+          - JSON
+        default: CSV
+
+# Required so the job can request a GitHub OIDC token and exchange it for
+# short-lived AWS credentials. No access keys are stored anywhere.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify repository variables are set
+        env:
+          ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          REGION: ${{ vars.AWS_REGION }}
+        run: |
+          if [ -z "$ROLE_ARN" ] || [ -z "$REGION" ]; then
+            echo "::error::Set the AWS_ROLE_ARN and AWS_REGION repository variables first. See the README, section on GitHub Actions."
+            exit 1
+          fi
+
+      - name: Assume the lab IAM role through OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Reuses the same script as the local option, so the export logic lives in one place.
+      - name: Export findings and wait for the report
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          PROJECT_NAME: ${{ vars.PROJECT_NAME || 'inspector-lab' }}
+          REPORT_FORMAT: ${{ inputs.report_format }}
+        run: bash scripts/export-report.sh

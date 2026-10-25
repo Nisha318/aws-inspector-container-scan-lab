@@ -140,6 +140,23 @@ data "aws_iam_policy_document" "github_push" {
     ]
     resources = [for repo in aws_ecr_repository.lab : repo.arn]
   }
+
+  # Lets the export-report workflow request and track a findings report.
+  # Inspector itself writes the file, using the bucket and key policies in storage.tf.
+  statement {
+    sid = "ExportInspectorFindings"
+    actions = [
+      "inspector2:CreateFindingsReport",
+      "inspector2:GetFindingsReportStatus",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid       = "ReadReportKey"
+    actions   = ["kms:DescribeKey"]
+    resources = [aws_kms_key.report.arn]
+  }
 }
 
 resource "aws_iam_role" "github_actions" {
