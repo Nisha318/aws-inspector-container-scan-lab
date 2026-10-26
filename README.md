@@ -14,8 +14,7 @@ The lab came from a real request: a team needed Inspector scan results for their
 | Inspector enhanced scanning | Scans images on push and keeps rescanning as new CVEs are published |
 | KMS key and S3 bucket | Receive the findings report. Inspector requires a customer-managed key |
 | GitHub OIDC role (optional) | Lets a GitHub Actions workflow push images with no stored access keys |
-| EventBridge Scheduler (optional) | Requests the findings report on a schedule, with no Lambda function or custom code |
-| SQS dead-letter queue (optional) | Catches the error when a scheduled export fails after its retries. An empty queue means every run succeeded |
+| EventBridge Scheduler (optional) | Requests the findings report on a schedule and sends failures to a dead-letter queue |
 
 Terraform builds everything except the images. You push those yourself in step 2, which mirrors how developers deliver images to ECR in real pipelines. Triage and suppression rules in step 4 are console exercises, so Terraform does not manage them.
 
@@ -176,6 +175,8 @@ Why these images? Inspector gives full findings only for operating systems it su
 - **Public exploit available** means working exploit code is known to exist. In the lab run, that was 224 findings. A critical finding with a public exploit and a fix available goes to the top of the list.
 - **No fix available** is a different decision. You may accept the risk, add a control around it, or wait for the vendor.
 
+![Inspector finding detail showing the CVE, affected package, and fixed-in version ALL](docs/images/inspector-finding-detail-all.png)
+
 ## Step 4: Triage and suppress findings
 
 A real team cannot work through hundreds of findings at once. Inspector lets you create a **suppression rule** that hides findings matching a filter, so the list shows what you want to act on.
@@ -235,8 +236,6 @@ Or run the **Export Inspector findings to S3** workflow from the Actions tab. Bo
 
 This is for the case where the people who need findings can't use Inspector, or where you want a report on a regular cadence. EventBridge Scheduler calls the Inspector `CreateFindingsReport` API directly, with no Lambda function or custom code. Inspector writes the file using the same bucket and key policies from step 5.
 
-Terraform creates three things for this step: the schedule, a small IAM role that lets Scheduler call Inspector, and an SQS dead-letter queue. Scheduler retries a failed run twice, an hour apart. If it still fails, the error message goes to the dead-letter queue instead of disappearing. Scheduler has no console page that lists failed runs, so the queue is how you find out. An empty queue means every run succeeded.
-
 Add these to `terraform.tfvars`:
 
 ```hcl
@@ -259,7 +258,7 @@ When the time passes, a new report appears in `exports/<customer>/` in the bucke
 
 ![S3 folder under exports/ containing the reports created by the schedule](docs/images/s3-scheduled-export.png)
 
-If no report shows up, check the dead-letter queue. A failed run leaves its error there for 14 days.
+If no report shows up, check the dead-letter queue. A failed run leaves its error there for 14 days. An empty queue means nothing failed.
 
 ```bash
 aws sqs receive-message \
