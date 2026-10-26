@@ -14,7 +14,8 @@ The lab came from a real request: a team needed Inspector scan results for their
 | Inspector enhanced scanning | Scans images on push and keeps rescanning as new CVEs are published |
 | KMS key and S3 bucket | Receive the findings report. Inspector requires a customer-managed key |
 | GitHub OIDC role (optional) | Lets a GitHub Actions workflow push images with no stored access keys |
-| EventBridge Scheduler (optional) | Requests the findings report on a schedule and sends failures to a dead-letter queue |
+| EventBridge Scheduler (optional) | Requests the findings report on a schedule, with no Lambda function or custom code |
+| SQS dead-letter queue (optional) | Catches the error when a scheduled export fails after its retries. An empty queue means every run succeeded |
 
 Terraform builds everything except the images. You push those yourself in step 2, which mirrors how developers deliver images to ECR in real pipelines. Triage and suppression rules in step 4 are console exercises, so Terraform does not manage them.
 
@@ -148,9 +149,13 @@ Workflow logs on a public repository are public. Both workflows mask your AWS ac
 
 Give Inspector a few minutes after the push finishes. Then look at the results in three places.
 
-**In ECR.** Open **Amazon ECR**, then **Private registry**, then **Repositories**. Open `inspector-lab/legacy-nginx` and check the vulnerability columns on the image. You will see counts by severity. Open an image to see the individual findings.
+**In ECR.** Open **Amazon ECR**, then **Private registry**, then **Repositories**. Open `inspector-lab/legacy-nginx` and check the vulnerability columns on the image. You will see counts by severity.
 
 ![ECR image list showing critical and high finding counts for each lab image](docs/images/ecr-findings-summary.png)
+
+To see the individual vulnerabilities, click the image tag. The page lists every vulnerability on that image, along with the scan status, the time of the last scan, and the severity counts. Each row shows the CVE name, the vulnerable package, the severity, the version that fixes it, and whether an exploit or a fix is available. Click a CVE name to read its full details. The **See extended details in Inspector** link on the same page opens the matching finding in Inspector.
+
+![ECR image page listing the vulnerabilities on the nginx image, with severity counts and fix availability](docs/images/ecr-image-vulnerabilities.png)
 
 **On the Inspector dashboard.** Open **Amazon Inspector** and stay on the **Summary** page. It shows active findings by severity, plus two numbers that matter for prioritizing: how many findings have a public exploit available, and how many have a fix available.
 
@@ -174,8 +179,6 @@ Why these images? Inspector gives full findings only for operating systems it su
 - **Fix available** means a patched version of the package exists. In the lab run, 450 of 566 findings had a fix, which is about 80 percent. For container images, the usual fix is to rebuild on a newer base image.
 - **Public exploit available** means working exploit code is known to exist. In the lab run, that was 224 findings. A critical finding with a public exploit and a fix available goes to the top of the list.
 - **No fix available** is a different decision. You may accept the risk, add a control around it, or wait for the vendor.
-
-![Inspector finding detail showing the CVE, affected package, and fixed-in version ALL](docs/images/inspector-finding-detail-all.png)
 
 ## Step 4: Triage and suppress findings
 
@@ -236,6 +239,8 @@ Or run the **Export Inspector findings to S3** workflow from the Actions tab. Bo
 
 This is for the case where the people who need findings can't use Inspector, or where you want a report on a regular cadence. EventBridge Scheduler calls the Inspector `CreateFindingsReport` API directly, with no Lambda function or custom code. Inspector writes the file using the same bucket and key policies from step 5.
 
+Terraform creates three things for this step: the schedule, a small IAM role that lets Scheduler call Inspector, and an SQS dead-letter queue. Scheduler retries a failed run twice, an hour apart. If it still fails, the error message goes to the dead-letter queue instead of disappearing. Scheduler has no console page that lists failed runs, so the queue is how you find out. An empty queue means every run succeeded.
+
 Add these to `terraform.tfvars`:
 
 ```hcl
@@ -258,7 +263,7 @@ When the time passes, a new report appears in `exports/<customer>/` in the bucke
 
 ![S3 folder under exports/ containing the reports created by the schedule](docs/images/s3-scheduled-export.png)
 
-If no report shows up, check the dead-letter queue. A failed run leaves its error there for 14 days. An empty queue means nothing failed.
+If no report shows up, check the dead-letter queue. A failed run leaves its error there for 14 days.
 
 ```bash
 aws sqs receive-message \
@@ -268,7 +273,34 @@ aws sqs receive-message \
 
 You can also open the schedule in the EventBridge console and look at its **Monitoring** tab.
 
+To see what Terraform created, open **Amazon EventBridge**, then **Schedules**, and select `inspector-lab-findings-export`. The **Schedule** tab shows the cron fields and the next ten run times in your time zone.
+
+![EventBridge schedule detail showing the cron expression and the next trigger dates](docs/images/eventbridge-schedule-detail.png)
+
+The **Target** tab shows the universal target. The service is Amazon Inspector V2, the API is `CreateFindingsReport`, and the payload carries the filter, the report format, and the S3 destination.
+
+![EventBridge schedule target showing the Inspector CreateFindingsReport API call and its payload](docs/images/eventbridge-schedule-target.png)
+
+The **Dead-letter queue** tab shows the SQS queue that catches failures. The queue has no settings to configure. It stays empty unless a run fails.
+
+![EventBridge schedule dead-letter queue tab showing the SQS queue that receives failed runs](docs/images/eventbridge-schedule-dlq.png)
+
 Each run adds a new file with a generated name. For anything long-running, add an S3 lifecycle rule to expire old reports.
+
+### What the scheduler's IAM role can do
+
+Terraform creates a role named `inspector-lab-export-scheduler` for Scheduler to use. In the IAM console it shows one inline policy, `request-findings-report`, with **Attached entities** at 0. That is normal for an inline policy, which belongs to the role and can't be attached anywhere else. Two parts control it.
+
+**The trust policy** says who may use the role. It names only the Scheduler service (`scheduler.amazonaws.com`) and adds a condition that the request must come from your own account (`aws:SourceAccount`). No person and no other service can assume it.
+
+**The permissions policy** has two statements:
+
+| Statement | Allows | Why |
+| --- | --- | --- |
+| `RequestFindingsReport` | `inspector2:CreateFindingsReport` on `*` | This is the one API call the schedule makes. The action doesn't accept a narrower resource, so the resource is `*` |
+| `ReportFailuresToDeadLetterQueue` | `sqs:SendMessage` on the `inspector-lab-export-failures` queue only | Lets Scheduler drop an error message into the dead-letter queue when a run fails |
+
+Notice what the role does not have. It has no S3 or KMS permissions. Inspector itself writes the report, using the bucket policy and key policy you set up in step 5, which name the Inspector service as the writer. The scheduler role only asks for the report. If the role were stolen, the worst it could do is request more reports.
 
 ## Troubleshooting
 
