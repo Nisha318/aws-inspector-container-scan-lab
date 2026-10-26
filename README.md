@@ -4,7 +4,7 @@ Deploy a small AWS environment with Terraform, push intentionally outdated conta
 
 The lab came from a real request: a cyber team needed Inspector scan results for container images, and they have no access to the AWS console. A report in an S3 bucket doesn't help them, because they can't open the bucket either. The real goal is delivering the findings to the cyber team outside AWS, automatically, on a schedule.
 
-This lab builds the first half. Inspector scans the images, and a scheduled export writes the report to an encrypted S3 bucket, which acts as a staging point. The second half is a job outside AWS that picks the report up and delivers it to the cyber team. The lab does not include that job. [Step 7](#step-7-delivering-the-report-outside-aws) describes the design.
+This lab builds the first half. Inspector scans the images, and a scheduled export writes the report to an encrypted S3 bucket, which acts as a staging point. The second half is a job outside AWS that picks the report up and delivers it to the cyber team. The lab does not include that job. [Step 7](#step-7-delivering-the-report-outside-aws) states the goal.
 
 ![Architecture and data flow](docs/images/architecture.png)
 
@@ -204,7 +204,7 @@ Inspector applies the rule in the background. Refresh the Findings page every mi
 
 ![Success banner after the rule is created, with the findings list still showing the low findings](docs/images/suppression-rule-created.png)
 
-[Watch a short walkthrough of this step](https://www.loom.com/share/REPLACE_WITH_YOUR_LINK)
+[Watch a short walkthrough of this step](https://youtu.be/EbShjNcKJtE)
 
 A note on counts: the findings table stops counting at 200 and shows **200+**, so an unfiltered total cannot show a before and after. Filter on severity as above and the count stays exact.
 
@@ -308,65 +308,46 @@ Notice what the role does not have. It has no S3 or KMS permissions. Inspector i
 
 ## Step 7: Delivering the report outside AWS
 
-This step is a design. The lab includes the AWS side of it, switched off by default, and I have not tested the whole path end to end.
-
-An S3 bucket does nothing for a team that can't open AWS, so a second job has to carry the report out. AWS could push the file to the other system, but that means storing a credential for that system inside AWS. The better direction is a pull. A job on the receiving side fetches the file, and AWS holds nothing.
-
-1. A scheduled workflow in the cyber team's repository runs after the export finishes. If the export runs Monday at 04:00, the delivery job runs later that morning.
-2. The workflow signs in to AWS with GitHub OIDC, the same keyless pattern the lab uses for pushing images.
-3. It assumes a read-only role. The role can list and read one customer's folder under `exports/` and decrypt with the report key. It can do nothing else.
-4. The workflow downloads the newest report and leaves it where the team works. A workflow artifact expires after a retention period you choose. A file committed to the repository stays in git history for good, so for vulnerability data the artifact is usually the safer choice.
-
-To create the read-only role, set `delivery_repo` in `terraform.tfvars` to the receiving repository, in `ORG/REPO` form. Leave it empty to skip every resource. The `delivery-repo-template` folder holds a starting workflow for that repository.
-
-Two conditions apply:
-
-- **AWS must reach the issuer.** AWS has to fetch the signing keys from your GitHub server's OIDC address over the internet, so the address must be public and use a certificate AWS trusts. A GitHub Enterprise Server on a private network won't work as the issuer.
-- **The cyber team must approve the storage.** The report lists every vulnerable package in the images. Where it may be stored, who may open it, and how long it is kept are decisions for the security team.
+The cyber team has no AWS console access, so the end goal is an automated job outside AWS that picks the report up from the bucket and delivers it to them. That job is not part of this lab. The optional `delivery_role.tf` is a starting point for the AWS side and stays off unless you set `delivery_repo`.
 
 ## Troubleshooting
 
-**The workflow fails with `Not authorized to perform sts:AssumeRoleWithWebIdentity`.** The IAM trust policy did not match the OIDC token. The diagram below shows the handshake. Step 5 is where most failures happen, when STS compares the token to the role's trust policy.
+**The workflow fails at the credentials step.** The "Assume the lab IAM role through OIDC" step prints:
 
-![Sequence diagram of the GitHub Actions OIDC handshake with AWS](docs/images/oidc-handshake.png)
+```text
+Error: Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity
+```
 
-The numbers on the diagram match this list:
+**Reason.** The role's trust policy did not match the claims in GitHub's OIDC token, most often the `sub` claim. Repositories created after July 15, 2026 send an immutable `sub` that includes numeric owner and repository IDs:
 
-1. The workflow asks GitHub's OIDC provider for a token, naming the audience `sts.amazonaws.com`. This only works when the job has `permissions: id-token: write`.
-2. GitHub returns a signed token. Its claims describe the run. Three matter here: `iss` (the issuer), `aud` (the audience), and `sub` (the subject, which encodes the repository and the branch, tag, pull request, or environment).
-3. The credentials action sends the token and the role ARN to AWS STS with `AssumeRoleWithWebIdentity`.
-4. STS looks for an OIDC provider in the account whose URL matches `iss`, checks that `aud` appears in the provider's client ID list, and verifies the token's signature against GitHub's public signing keys.
-5. STS evaluates the role's trust policy. The principal must be that provider, and the conditions on `aud` and `sub` must match the token's values exactly.
-6. If every check passes, the request is allowed.
-7. STS returns temporary credentials, valid for about one hour.
-8. The job uses those credentials, and the role's permission policies decide what it can do, such as pushing to ECR.
+```text
+repo:OWNER/REPO:ref:refs/heads/main                       (older form)
+repo:OWNER@OWNER_ID/REPO@REPO_ID:ref:refs/heads/main      (immutable form)
+```
 
-A failure at steps 1 to 5 stops the job at the credentials step. A failure at step 8 shows up later as an `AccessDenied` error on the actual API call, such as an ECR push. That is a permissions problem, and nothing in the trust policy will fix it.
+A policy written for the older form never matches the new one. Set `github_owner_id` and `github_repo_id` in `terraform.tfvars` and apply. GitHub explains the change in its [changelog](https://github.blog/changelog/2026-04-23-immutable-subject-claims-for-github-actions-oidc-tokens). Also rule out a missing `permissions: id-token: write`, a run from a branch other than `github_branch`, and a provider audience that lacks `sts.amazonaws.com`.
 
-Here is what the failure looks like in the Actions log, on the credentials step:
+**Troubleshooting step.** Add this step to the workflow just before the credentials step. It prints selected claims only. Never print the token itself, because anyone who sees it in a log can replay it until it expires. Compare the printed `sub` with the `sub` condition on the role, then remove the step.
 
-![GitHub Actions log showing Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity](docs/images/oidc-assume-role-error.png)
+```yaml
+      - name: Debug OIDC claims (temporary)
+        run: |
+          TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+          export TOKEN
+          python3 - <<'PY'
+          import os, json, base64
+          part = os.environ['TOKEN'].split('.')[1]
+          claims = json.loads(base64.urlsafe_b64decode(part + '=' * (-len(part) % 4)))
+          for key in ('sub', 'aud', 'iss', 'ref', 'repository'):
+              print(f'{key}: {claims.get(key)}')
+          PY
+```
 
-The credentials action retries on its own, so a failing run repeats "Assuming role with OIDC" about a dozen times and can take over a minute to give up. Treat the repeats as one failure.
-
-Print the token's `sub` claim in a debug step, compare it to the `sub` condition on the role, and check for these causes in order:
-
-1. The workflow is missing `permissions: id-token: write`.
-2. The role's `sub` condition uses `repo:OWNER/REPO`, but the token uses the immutable form `repo:OWNER@OWNER_ID/REPO@REPO_ID`. Set `github_owner_id` and `github_repo_id`, then apply.
-3. The workflow ran from a branch other than `github_branch`.
-4. The provider's audience does not include `sts.amazonaws.com`.
-
-The debug step prints the claims the token carries. In the lab run, the `sub` value had the immutable form with the numeric owner and repository IDs, which the original trust policy did not expect.
-
-![Debug step output showing the sub, aud, and iss claims of the GitHub OIDC token](docs/images/oidc-token-claims.png)
-
-After you change the trust policy, run `terraform apply` and confirm the change landed with `aws iam get-role`. The configure-credentials action retries for a couple of minutes before it reports failure, so a failed run can take a while to appear.
-
-**The credentials step fails with `Input required and not supplied: aws-region`.** The workflow read an empty repository variable. Open the repository's **Settings**, then **Secrets and variables**, then **Actions**, and add `AWS_REGION` and `AWS_ROLE_ARN` on the **Variables** tab, at repository level. A variable set under an environment is invisible to a job that does not declare that environment.
+**The credentials step fails with `Input required and not supplied: aws-region`.** The workflow read an empty repository variable. Add `AWS_REGION` and `AWS_ROLE_ARN` under **Settings**, **Secrets and variables**, **Actions**, **Variables**, at repository level. A variable set under an environment is invisible to a job that does not declare that environment.
 
 ![GitHub Actions log showing Input required and not supplied: aws-region on the Assume the lab IAM role step](docs/images/github-actions-missing-region.png)
 
-The lab hit this error on its first run, and then the trust policy error on the next ones. The run list shows the order of events: four failures, then a green run once both were fixed.
+The lab run hit this error first and the trust policy error next. The run list shows four failures, then a green run.
 
 ![GitHub Actions run list showing four failed runs followed by a successful run](docs/images/github-actions-run-history.png)
 
