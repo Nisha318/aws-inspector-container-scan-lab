@@ -41,6 +41,8 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
+          # Public repo, public logs: print the account ID as *** in every step.
+          mask-aws-account-id: true
 
       # Reuses the same script as the local option, so the export logic lives in one place.
       - name: Export findings and wait for the report

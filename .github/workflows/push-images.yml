@@ -17,22 +17,13 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Verify repository variables are set
-        env:
-          ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
-          REGION: ${{ vars.AWS_REGION }}
-        run: |
-          if [ -z "$ROLE_ARN" ] || [ -z "$REGION" ]; then
-            echo "::error::Set the AWS_ROLE_ARN and AWS_REGION repository variables first. See the README, section on GitHub Actions."
-            exit 1
-          fi
-
-      
       - name: Assume the lab IAM role through OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
+          # Public repo, public logs: print the account ID as *** in every step.
+          mask-aws-account-id: true
 
       # Reuses the same script as the local option, so the image list lives in one place.
       - name: Pull outdated images and push them to ECR

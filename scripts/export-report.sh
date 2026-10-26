@@ -24,6 +24,13 @@ if ! command -v aws >/dev/null 2>&1; then
 fi
 
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+
+# In GitHub Actions the log is public on a public repo. Tell the runner to
+# mask the account ID so it prints as *** everywhere it appears (bucket name,
+# KMS key ARN, registry URL).
+if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+  echo "::add-mask::${ACCOUNT_ID}"
+fi
 BUCKET="${PROJECT_NAME}-reports-${ACCOUNT_ID}-${AWS_REGION}"
 KMS_ARN="$(aws kms describe-key --region "$AWS_REGION" \
   --key-id "alias/${PROJECT_NAME}-report" \
