@@ -14,7 +14,8 @@ The lab came from a real request: a team needed Inspector scan results for their
 | Inspector enhanced scanning | Scans images on push and keeps rescanning as new CVEs are published |
 | KMS key and S3 bucket | Receive the findings report. Inspector requires a customer-managed key |
 | GitHub OIDC role (optional) | Lets a GitHub Actions workflow push images with no stored access keys |
-| EventBridge Scheduler (optional) | Requests the findings report on a schedule and sends failures to a dead-letter queue |
+| EventBridge Scheduler (optional) | Requests the findings report on a schedule, with no Lambda function or custom code |
+| SQS dead-letter queue (optional) | Catches the error when a scheduled export fails after its retries. An empty queue means every run succeeded |
 
 Terraform builds everything except the images. You push those yourself in step 2, which mirrors how developers deliver images to ECR in real pipelines. Triage and suppression rules in step 4 are console exercises, so Terraform does not manage them.
 
@@ -234,6 +235,8 @@ Or run the **Export Inspector findings to S3** workflow from the Actions tab. Bo
 
 This is for the case where the people who need findings can't use Inspector, or where you want a report on a regular cadence. EventBridge Scheduler calls the Inspector `CreateFindingsReport` API directly, with no Lambda function or custom code. Inspector writes the file using the same bucket and key policies from step 5.
 
+Terraform creates three things for this step: the schedule, a small IAM role that lets Scheduler call Inspector, and an SQS dead-letter queue. Scheduler retries a failed run twice, an hour apart. If it still fails, the error message goes to the dead-letter queue instead of disappearing. Scheduler has no console page that lists failed runs, so the queue is how you find out. An empty queue means every run succeeded.
+
 Add these to `terraform.tfvars`:
 
 ```hcl
@@ -256,7 +259,7 @@ When the time passes, a new report appears in `exports/<customer>/` in the bucke
 
 ![S3 folder under exports/ containing the reports created by the schedule](docs/images/s3-scheduled-export.png)
 
-If no report shows up, check the dead-letter queue. A failed run leaves its error there for 14 days. An empty queue means nothing failed.
+If no report shows up, check the dead-letter queue. A failed run leaves its error there for 14 days.
 
 ```bash
 aws sqs receive-message \
