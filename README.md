@@ -2,7 +2,9 @@
 
 Deploy a small AWS environment with Terraform, push intentionally outdated container images into Amazon ECR, and watch Amazon Inspector find the vulnerabilities. Then triage the findings, and export the report to an encrypted S3 bucket, either by hand in the console or automatically on a schedule.
 
-The lab came from a real request: a team needed Inspector scan results for their container images, and the people who owned those images had no access to the Inspector console. Exporting reports to S3 on a schedule solves that. The people who need the findings never have to log in to Inspector.
+The lab came from a real request: a cyber team needed Inspector scan results for container images, and they have no access to the AWS console. A report in an S3 bucket doesn't help them, because they can't open the bucket either. The real goal is delivering the findings to the cyber team outside AWS, automatically, on a schedule.
+
+This lab builds the first half. Inspector scans the images, and a scheduled export writes the report to an encrypted S3 bucket, which acts as a staging point. The second half is a job outside AWS that picks the report up and delivers it to the cyber team. The lab does not include that job. [Step 7](#step-7-delivering-the-report-outside-aws) describes the design.
 
 ![Architecture and data flow](docs/images/architecture.png)
 
@@ -63,6 +65,8 @@ This lab sets registry scanning to continuous, but it scopes the filter to repos
 ├── storage.tf               KMS key and report bucket, with Inspector's access policies
 ├── github_oidc.tf           Optional OIDC role for the Actions workflow
 ├── scheduled_export.tf      Optional scheduled findings export
+├── delivery_role.tf         Optional read-only role for the delivery job (step 7), off by default
+├── delivery-repo-template/  Starting workflow for the repository that receives the reports
 ├── outputs.tf
 ├── scripts/
 │   ├── push-images.sh       Pushes the outdated images (option A)
@@ -237,7 +241,7 @@ Or run the **Export Inspector findings to S3** workflow from the Actions tab. Bo
 
 ## Step 6 (optional): Export automatically on a schedule
 
-This is for the case where the people who need findings can't use Inspector, or where you want a report on a regular cadence. EventBridge Scheduler calls the Inspector `CreateFindingsReport` API directly, with no Lambda function or custom code. Inspector writes the file using the same bucket and key policies from step 5.
+This is for the case where the people who need findings can't use the AWS console, or where you want a report on a regular cadence. The report lands in S3, and a separate job has to carry it from there to the readers (see step 7). EventBridge Scheduler calls the Inspector `CreateFindingsReport` API directly, with no Lambda function or custom code. Inspector writes the file using the same bucket and key policies from step 5.
 
 Terraform creates three things for this step: the schedule, a small IAM role that lets Scheduler call Inspector, and an SQS dead-letter queue. Scheduler retries a failed run twice, an hour apart. If it still fails, the error message goes to the dead-letter queue instead of disappearing. Scheduler has no console page that lists failed runs, so the queue is how you find out. An empty queue means every run succeeded.
 
@@ -302,11 +306,48 @@ Terraform creates a role named `inspector-lab-export-scheduler` for Scheduler to
 
 Notice what the role does not have. It has no S3 or KMS permissions. Inspector itself writes the report, using the bucket policy and key policy you set up in step 5, which name the Inspector service as the writer. The scheduler role only asks for the report. If the role were stolen, the worst it could do is request more reports.
 
+## Step 7: Delivering the report outside AWS
+
+This step is a design. The lab includes the AWS side of it, switched off by default, and I have not tested the whole path end to end.
+
+An S3 bucket does nothing for a team that can't open AWS, so a second job has to carry the report out. AWS could push the file to the other system, but that means storing a credential for that system inside AWS. The better direction is a pull. A job on the receiving side fetches the file, and AWS holds nothing.
+
+1. A scheduled workflow in the cyber team's repository runs after the export finishes. If the export runs Monday at 04:00, the delivery job runs later that morning.
+2. The workflow signs in to AWS with GitHub OIDC, the same keyless pattern the lab uses for pushing images.
+3. It assumes a read-only role. The role can list and read one customer's folder under `exports/` and decrypt with the report key. It can do nothing else.
+4. The workflow downloads the newest report and leaves it where the team works. A workflow artifact expires after a retention period you choose. A file committed to the repository stays in git history for good, so for vulnerability data the artifact is usually the safer choice.
+
+To create the read-only role, set `delivery_repo` in `terraform.tfvars` to the receiving repository, in `ORG/REPO` form. Leave it empty to skip every resource. The `delivery-repo-template` folder holds a starting workflow for that repository.
+
+Two conditions apply:
+
+- **AWS must reach the issuer.** AWS has to fetch the signing keys from your GitHub server's OIDC address over the internet, so the address must be public and use a certificate AWS trusts. A GitHub Enterprise Server on a private network won't work as the issuer.
+- **The cyber team must approve the storage.** The report lists every vulnerable package in the images. Where it may be stored, who may open it, and how long it is kept are decisions for the security team.
+
 ## Troubleshooting
 
 **The workflow fails with `Not authorized to perform sts:AssumeRoleWithWebIdentity`.** The IAM trust policy did not match the OIDC token. The diagram below shows the handshake. Step 5 is where most failures happen, when STS compares the token to the role's trust policy.
 
 ![Sequence diagram of the GitHub Actions OIDC handshake with AWS](docs/images/oidc-handshake.png)
+
+The numbers on the diagram match this list:
+
+1. The workflow asks GitHub's OIDC provider for a token, naming the audience `sts.amazonaws.com`. This only works when the job has `permissions: id-token: write`.
+2. GitHub returns a signed token. Its claims describe the run. Three matter here: `iss` (the issuer), `aud` (the audience), and `sub` (the subject, which encodes the repository and the branch, tag, pull request, or environment).
+3. The credentials action sends the token and the role ARN to AWS STS with `AssumeRoleWithWebIdentity`.
+4. STS looks for an OIDC provider in the account whose URL matches `iss`, checks that `aud` appears in the provider's client ID list, and verifies the token's signature against GitHub's public signing keys.
+5. STS evaluates the role's trust policy. The principal must be that provider, and the conditions on `aud` and `sub` must match the token's values exactly.
+6. If every check passes, the request is allowed.
+7. STS returns temporary credentials, valid for about one hour.
+8. The job uses those credentials, and the role's permission policies decide what it can do, such as pushing to ECR.
+
+A failure at steps 1 to 5 stops the job at the credentials step. A failure at step 8 shows up later as an `AccessDenied` error on the actual API call, such as an ECR push. That is a permissions problem, and nothing in the trust policy will fix it.
+
+Here is what the failure looks like in the Actions log, on the credentials step:
+
+![GitHub Actions log showing Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity](docs/images/oidc-assume-role-error.png)
+
+The credentials action retries on its own, so a failing run repeats "Assuming role with OIDC" about a dozen times and can take over a minute to give up. Treat the repeats as one failure.
 
 Print the token's `sub` claim in a debug step, compare it to the `sub` condition on the role, and check for these causes in order:
 
@@ -315,7 +356,19 @@ Print the token's `sub` claim in a debug step, compare it to the `sub` condition
 3. The workflow ran from a branch other than `github_branch`.
 4. The provider's audience does not include `sts.amazonaws.com`.
 
+The debug step prints the claims the token carries. In the lab run, the `sub` value had the immutable form with the numeric owner and repository IDs, which the original trust policy did not expect.
+
+![Debug step output showing the sub, aud, and iss claims of the GitHub OIDC token](docs/images/oidc-token-claims.png)
+
 After you change the trust policy, run `terraform apply` and confirm the change landed with `aws iam get-role`. The configure-credentials action retries for a couple of minutes before it reports failure, so a failed run can take a while to appear.
+
+**The credentials step fails with `Input required and not supplied: aws-region`.** The workflow read an empty repository variable. Open the repository's **Settings**, then **Secrets and variables**, then **Actions**, and add `AWS_REGION` and `AWS_ROLE_ARN` on the **Variables** tab, at repository level. A variable set under an environment is invisible to a job that does not declare that environment.
+
+![GitHub Actions log showing Input required and not supplied: aws-region on the Assume the lab IAM role step](docs/images/github-actions-missing-region.png)
+
+The lab hit this error on its first run, and then the trust policy error on the next ones. The run list shows the order of events: four failures, then a green run once both were fixed.
+
+![GitHub Actions run list showing four failed runs followed by a successful run](docs/images/github-actions-run-history.png)
 
 **`EntityAlreadyExists` for the OIDC provider.** Your account already has one. Set `create_github_oidc_provider = false`.
 
