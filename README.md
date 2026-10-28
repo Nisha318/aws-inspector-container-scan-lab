@@ -153,11 +153,7 @@ Workflow logs on a public repository are public. Both workflows mask your AWS ac
 
 Give Inspector a few minutes after the push finishes. Then look at the results in three places.
 
-**In ECR.** Open **Amazon ECR**, then **Private registry**, then **Repositories**. Open `inspector-lab/legacy-nginx` and check the vulnerability columns on the image. You will see counts by severity.
-
-![ECR image list showing critical and high finding counts for each lab image](docs/images/ecr-findings-summary.png)
-
-To see the individual vulnerabilities, click the image tag. The page lists every vulnerability on that image, along with the scan status, the time of the last scan, and the severity counts. Each row shows the CVE name, the vulnerable package, the severity, the version that fixes it, and whether an exploit or a fix is available. Click a CVE name to read its full details. The **See extended details in Inspector** link on the same page opens the matching finding in Inspector.
+**In ECR.** Open **Amazon ECR**, then **Private registry**, then **Repositories**. Open `inspector-lab/legacy-nginx` and click the image tag. The page shows the scan status, the time of the last scan, and the severity counts, followed by a table of every vulnerability on that image. Each row shows the CVE name, the vulnerable package, the severity, the version that fixes it, and whether an exploit or a fix is available. Click a CVE name to read its full details. The **See extended details in Inspector** link on the same page opens the matching finding in Inspector.
 
 ![ECR image page listing the vulnerabilities on the nginx image, with severity counts and fix availability](docs/images/ecr-image-vulnerabilities.png)
 

@@ -8,7 +8,7 @@
 # Leave var.delivery_repo empty to skip every resource in this file.
 
 variable "delivery_repo" {
-  description = "Repository in ORG/REPO form whose workflow may download reports, for example cyber/mission-owner-findings. Leave empty to skip."
+  description = "Repository in ORG/REPO form whose workflow may download reports, for example cyber/team-a-findings. Leave empty to skip."
   type        = string
   default     = ""
 
