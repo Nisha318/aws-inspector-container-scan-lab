@@ -33,19 +33,26 @@ variable "export_customer" {
   }
 }
 
-variable "export_report_format" {
-  description = "CSV or JSON."
-  type        = string
-  default     = "CSV"
+variable "export_report_formats" {
+  description = <<-EOT
+    Report formats to export on each run. One schedule is created per format,
+    and all of them fire at the same time. The default produces both a CSV for
+    people and a JSON for tooling. Set to ["CSV"] for a single report.
+  EOT
+  type        = set(string)
+  default     = ["CSV", "JSON"]
 
   validation {
-    condition     = contains(["CSV", "JSON"], var.export_report_format)
-    error_message = "export_report_format must be CSV or JSON."
+    condition     = length(var.export_report_formats) > 0 && alltrue([for f in var.export_report_formats : contains(["CSV", "JSON"], f)])
+    error_message = "export_report_formats must contain at least one of CSV or JSON."
   }
 }
 
 locals {
   enable_scheduled_export = var.export_schedule != ""
+
+  # Empty when the schedule is off, so for_each creates nothing.
+  export_formats = local.enable_scheduled_export ? var.export_report_formats : toset([])
 }
 
 data "aws_iam_policy_document" "export_scheduler_trust" {
@@ -108,10 +115,12 @@ resource "aws_iam_role_policy" "export_scheduler" {
   policy = data.aws_iam_policy_document.export_scheduler[0].json
 }
 
+# One schedule per format. They share the role and dead-letter queue above and
+# fire at the same minute, so each run leaves one file per format in the bucket.
 resource "aws_scheduler_schedule" "export" {
-  count = local.enable_scheduled_export ? 1 : 0
+  for_each = local.export_formats
 
-  name                         = "${var.project_name}-findings-export"
+  name                         = "${var.project_name}-findings-export-${lower(each.key)}"
   schedule_expression          = var.export_schedule
   schedule_expression_timezone = var.export_schedule_timezone
 
@@ -135,7 +144,7 @@ resource "aws_scheduler_schedule" "export" {
     # Parameter names follow the Inspector API in PascalCase. The filter limits
     # the report to active findings on this customer's repositories.
     input = jsonencode({
-      ReportFormat = var.export_report_format
+      ReportFormat = each.key
       S3Destination = {
         BucketName = aws_s3_bucket.report.id
         KeyPrefix  = "exports/${var.export_customer}"
@@ -152,6 +161,11 @@ resource "aws_scheduler_schedule" "export" {
 output "export_failure_queue_url" {
   description = "Check this queue when a scheduled export produces no report. Null when export_schedule is empty."
   value       = one(aws_sqs_queue.export_dlq[*].url)
+}
+
+output "scheduled_export_names" {
+  description = "EventBridge schedule names, one per report format. Empty when export_schedule is empty."
+  value       = [for s in aws_scheduler_schedule.export : s.name]
 }
 
 output "scheduled_export_prefix" {

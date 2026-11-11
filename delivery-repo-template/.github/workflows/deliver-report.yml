@@ -1,0 +1,84 @@
+name: Deliver Inspector findings reports
+
+# Pull model. This repository fetches the newest reports from the staging bucket
+# on its own schedule, so nothing in AWS ever holds a GitHub credential and the
+# team that owns this repository decides when it changes.
+#
+# Run it after the export schedule in the AWS account, with enough room for
+# Inspector to finish writing both reports. An hour is plenty. GitHub cron is
+# always UTC, while the Terraform schedule uses export_schedule_timezone, so
+# convert before you set this. The default below runs daily at 12:00 UTC
+# (06:00 Central), one hour after a daily 05:00 Central export. A scheduled run
+# that finds nothing new makes no commit, so a daily check is cheap even when
+# the export itself runs monthly.
+on:
+  schedule:
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+
+# id-token lets the job request an OIDC token and trade it for AWS credentials.
+# contents: write lets it push the commit that files the reports.
+permissions:
+  id-token: write
+  contents: write
+
+# Never let two deliveries run at once. A manual run that overlaps the schedule
+# would otherwise race on the push.
+concurrency:
+  group: deliver-report
+  cancel-in-progress: false
+
+jobs:
+  deliver:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify repository variables are set
+        env:
+          ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          REGION: ${{ vars.AWS_REGION }}
+          BUCKET: ${{ vars.REPORT_BUCKET }}
+          PREFIX: ${{ vars.REPORT_PREFIX }}
+        run: |
+          missing=""
+          [ -z "$ROLE_ARN" ] && missing="$missing AWS_ROLE_ARN"
+          [ -z "$REGION" ]   && missing="$missing AWS_REGION"
+          [ -z "$BUCKET" ]   && missing="$missing REPORT_BUCKET"
+          [ -z "$PREFIX" ]   && missing="$missing REPORT_PREFIX"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository variables:$missing. See README.md in this repository."
+            exit 1
+          fi
+
+      # The role here is the lab's delivery role (delivery_role_arn output),
+      # not the push role the lab repository uses. It can only list, read,
+      # and decrypt this customer's prefix in the report bucket.
+      - name: Assume the delivery role through OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          mask-aws-account-id: true
+
+      # The script writes into <customer>-inspector-scans/<report date>/ and
+      # exits 0 without changing anything when the newest reports are already
+      # filed, so a scheduled run with nothing new produces no commit.
+      - name: Fetch the newest reports from the staging bucket
+        env:
+          REPORT_BUCKET: ${{ vars.REPORT_BUCKET }}
+          REPORT_PREFIX: ${{ vars.REPORT_PREFIX }}
+        run: bash scripts/fetch-latest-report.sh
+
+      - name: Commit and push new reports
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No new reports to commit."
+            exit 0
+          fi
+          git commit -m "Deliver Inspector findings reports $(date -u +%Y-%m-%d)"
+          git push

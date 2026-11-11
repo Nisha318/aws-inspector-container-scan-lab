@@ -4,7 +4,7 @@ Deploy a small AWS environment with Terraform, push intentionally outdated conta
 
 The lab came from a real request: a cyber team needed Inspector scan results for container images, and they have no access to the AWS console. A report in an S3 bucket doesn't help them, because they can't open the bucket either. The real goal is delivering the findings to the cyber team outside AWS, automatically, on a schedule.
 
-This lab builds the first half. Inspector scans the images, and a scheduled export writes the report to an encrypted S3 bucket, which acts as a staging point. The second half is a job outside AWS that picks the report up and delivers it to the cyber team. The lab does not include that job. [Step 7](#step-7-delivering-the-report-outside-aws) states the goal.
+The lab builds both halves. Inspector scans the images, and a scheduled export writes the reports to an encrypted S3 bucket, which acts as a staging point. Then a GitHub Actions workflow in a second repository, one the cyber team can read, assumes a read-only role through OIDC, downloads the newest reports, and commits them into a folder named for the date they were generated. [Step 7](#step-7-deliver-the-reports-to-a-github-repository) builds that second repository from the template in `delivery-repo-template/`.
 
 ![Architecture and data flow](docs/images/architecture.png)
 
@@ -64,9 +64,12 @@ This lab sets registry scanning to continuous, but it scopes the filter to repos
 ├── ecr.tf                   The two lab repositories
 ├── storage.tf               KMS key and report bucket, with Inspector's access policies
 ├── github_oidc.tf           Optional OIDC role for the Actions workflow
-├── scheduled_export.tf      Optional scheduled findings export
-├── delivery_role.tf         Optional read-only role for the delivery job (step 7), off by default
-├── delivery-repo-template/  Starting workflow for the repository that receives the reports
+├── scheduled_export.tf      Optional scheduled findings export, one schedule per format
+├── delivery_role.tf         Optional read-only role for the delivery workflow (step 7), off by default
+├── delivery-repo-template/  Contents of the repository that receives the reports (step 7)
+│   ├── README.md            Setup steps and what readers will find
+│   ├── scripts/fetch-latest-report.sh
+│   └── .github/workflows/deliver-report.yml
 ├── outputs.tf
 ├── scripts/
 │   ├── push-images.sh       Pushes the outdated images (option A)
@@ -239,7 +242,7 @@ Or run the **Export Inspector findings to S3** workflow from the Actions tab. Bo
 
 This is for the case where the people who need findings can't use the AWS console, or where you want a report on a regular cadence. The report lands in S3, and a separate job has to carry it from there to the readers (see step 7). EventBridge Scheduler calls the Inspector `CreateFindingsReport` API directly, with no Lambda function or custom code. Inspector writes the file using the same bucket and key policies from step 5.
 
-Terraform creates three things for this step: the schedule, a small IAM role that lets Scheduler call Inspector, and an SQS dead-letter queue. Scheduler retries a failed run twice, an hour apart. If it still fails, the error message goes to the dead-letter queue instead of disappearing. Scheduler has no console page that lists failed runs, so the queue is how you find out. An empty queue means every run succeeded.
+Terraform creates two schedules for this step, one that requests a CSV report and one that requests a JSON report, both on the same cron expression. Each run therefore leaves two files in the bucket: a CSV for people to open in a spreadsheet and a JSON for tooling. Set `export_report_formats = ["CSV"]` if you only want one. Alongside the schedules it creates a small IAM role that lets Scheduler call Inspector, and an SQS dead-letter queue. Scheduler retries a failed run twice, an hour apart. If it still fails, the error message goes to the dead-letter queue instead of disappearing. Scheduler has no console page that lists failed runs, so the queue is how you find out. An empty queue means every run succeeded.
 
 Add these to `terraform.tfvars`:
 
@@ -259,7 +262,7 @@ To test without waiting a week, use a one-time schedule a few minutes ahead. All
 export_schedule = "at(2026-11-02T09:30:00)"
 ```
 
-When the time passes, a new report appears in `exports/<customer>/` in the bucket within a minute or two. Change the value back to your real schedule afterward and apply again. The report contains active findings for the lab repositories only, so suppressed findings are left out.
+When the time passes, two new reports appear in `exports/<customer>/` in the bucket within a minute or two, one `.csv` and one `.json`, each named after its Inspector report ID. Change the value back to your real schedule afterward and apply again. The report contains active findings for the lab repositories only, so suppressed findings are left out.
 
 ![S3 folder under exports/ containing the reports created by the schedule](docs/images/s3-scheduled-export.png)
 
@@ -273,7 +276,7 @@ aws sqs receive-message \
 
 You can also open the schedule in the EventBridge console and look at its **Monitoring** tab.
 
-To see what Terraform created, open **Amazon EventBridge**, then **Schedules**, and select `inspector-lab-findings-export`. The **Schedule** tab shows the cron fields and the next ten run times in your time zone.
+To see what Terraform created, open **Amazon EventBridge**, then **Schedules**. There is one schedule per report format, `inspector-lab-findings-export-csv` and `inspector-lab-findings-export-json`, both on the same cron expression. Select either one. The **Schedule** tab shows the cron fields and the next ten run times in your time zone.
 
 ![EventBridge schedule detail showing the cron expression and the next trigger dates](docs/images/eventbridge-schedule-detail.png)
 
@@ -302,9 +305,53 @@ Terraform creates a role named `inspector-lab-export-scheduler` for Scheduler to
 
 Notice what the role does not have. It has no S3 or KMS permissions. Inspector itself writes the report, using the bucket policy and key policy you set up in step 5, which name the Inspector service as the writer. The scheduler role only asks for the report. If the role were stolen, the worst it could do is request more reports.
 
-## Step 7: Delivering the report outside AWS
+## Step 7: Deliver the reports to a GitHub repository
 
-The cyber team has no AWS console access, so the end goal is an automated job outside AWS that picks the report up from the bucket and delivers it to them. That job is not part of this lab. The optional `delivery_role.tf` is a starting point for the AWS side and stays off unless you set `delivery_repo`.
+The cyber team has no AWS console access, so the reports have to leave AWS on their own. This step builds a second repository that they can read. A workflow in it runs on a schedule, assumes a read-only role in the lab account through OIDC, downloads the newest CSV and JSON reports from the bucket, and commits them under a folder named for the date they were generated:
+
+```
+team-a-inspector-scans/
+└── 2026-11-10/
+    ├── findings-<report id>.csv
+    ├── findings-<report id>.json
+    └── SOURCE.txt
+```
+
+This is a pull model. The delivery repository reaches into AWS with short-lived credentials. Nothing in AWS holds a GitHub credential, and nothing in AWS needs to know the repository exists beyond the role's trust policy. The alternative, an S3 event that triggers a `repository_dispatch` call into GitHub, would need a GitHub token stored in AWS and a Lambda function or EventBridge API destination to send it. The pull model needs neither.
+
+### The AWS side
+
+`delivery_role.tf` creates one IAM role and stays off until you set `delivery_repo` in `terraform.tfvars`:
+
+```hcl
+delivery_repo = "my-org/team-a-inspector-findings"
+```
+
+Apply, then note the `delivery_role_arn` output. The role trusts OIDC tokens from that repository's `main` branch only, and its permissions are narrow:
+
+| Statement | Allows | Why |
+| --- | --- | --- |
+| `ListThisCustomersReports` | `s3:ListBucket` on the report bucket, with `s3:prefix` limited to `exports/<customer>/*` | The workflow needs to find the newest objects |
+| `ReadThisCustomersReports` | `s3:GetObject` under `exports/<customer>/` only | Download them |
+| `DecryptReports` | `kms:Decrypt` on the report key | Inspector encrypted them with it |
+
+The role cannot write to the bucket, read another customer's prefix, or call Inspector. Each customer gets their own repository, prefix, and role.
+
+If the delivery repository lives on GitHub Enterprise Server rather than github.com, set `delivery_oidc_url` to `https://YOUR-GHES-HOST/_services/token`. The IAM OIDC provider for that URL must already exist in the account, since `delivery_role.tf` looks it up and never creates it. Repositories created on github.com after July 15, 2026 send the immutable `sub` format, so set `delivery_subject_override` to the real subject. The troubleshooting section shows how to print it.
+
+### The GitHub side
+
+Create a new private repository and copy the contents of `delivery-repo-template/` into it. The template's README walks through the rest: four repository variables (`AWS_ROLE_ARN`, `AWS_REGION`, `REPORT_BUCKET`, `REPORT_PREFIX`), the cron schedule, and a first manual run. Give the cyber team read access and you are done.
+
+The workflow is short. It assumes the role with `aws-actions/configure-aws-credentials`, runs `scripts/fetch-latest-report.sh`, and commits whatever the script wrote. The script records every delivered object key in a `.delivered` file, so a scheduled run that finds nothing new changes no files and the workflow makes no commit. That makes a daily delivery check harmless even when the export itself runs monthly.
+
+### Why the date can differ from the export time
+
+The folder date comes from the S3 object's `LastModified` time, which is UTC. An export scheduled for 10:00 PM Central lands under the next day's date. The two formats are also separate reports, so on rare occasions one can finish before midnight UTC and the other after, which puts them in neighboring folders. `SOURCE.txt` in each folder records the report ID and generation time, so nothing is lost.
+
+### What the lab does not do
+
+The template pushes to `main` with the run's own `GITHUB_TOKEN`, so `main` must not be branch-protected in the delivery repository. If your organization requires protection on every repository, add the GitHub Actions app to the ruleset's bypass list, or change the workflow to check out and push a `reports` branch instead.
 
 ## Troubleshooting
 
