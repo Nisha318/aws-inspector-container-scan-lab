@@ -82,7 +82,9 @@ Inspector cannot write a report with the AWS-managed `aws/s3` key, because that 
 
 ## The scheduled export
 
-EventBridge Scheduler calls the Inspector `CreateFindingsReport` API directly, as a "universal target." No Lambda function, no custom code. Terraform creates one schedule per report format on the same cron expression, so each run leaves a CSV and a JSON in the bucket.
+EventBridge Scheduler calls the Inspector `CreateFindingsReport` API directly, as a "universal target." No Lambda function, no custom code. Terraform creates one schedule per report format, so each run leaves a CSV and a JSON in the bucket.
+
+The two schedules do not fire together. Inspector generates one findings report at a time per account, and a second request while one is in progress fails immediately with `ValidationException: Cannot have multiple reports in-progress`. The lab found this the hard way: on the first scheduled morning, both schedules fired in the same minute, the JSON succeeded, the CSV was rejected, and the dead-letter queue alarm emailed the operators six minutes later. Terraform now shifts each format by `export_format_stagger_minutes` (default 10), so `cron(0 4 ? * MON *)` becomes 04:00 for CSV and 04:10 for JSON. A validation error is not retried, which is why the alarm fired within minutes rather than after the retry window.
 
 EventBridge cron has six fields: minute, hour, day of month, month, day of week, year. A weekly schedule puts `?` in the day-of-month field and a day name in the day-of-week field. `cron(0 4 ? * MON *)` is Mondays at 04:00. The schedule evaluates in `export_schedule_timezone`, and Scheduler handles daylight saving shifts.
 

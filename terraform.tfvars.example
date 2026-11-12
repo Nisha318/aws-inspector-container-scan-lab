@@ -28,6 +28,7 @@ create_github_oidc_provider = true
 # export_schedule          = "cron(0 4 ? * MON *)"   # Mondays at 04:00 in the time zone below
 # export_schedule_timezone = "America/Chicago"
 # export_report_formats    = ["CSV", "JSON"]         # the default. ["CSV"] for one file per run
+# export_format_stagger_minutes = 10                   # JSON fires this many minutes after CSV. Inspector runs one report at a time
 
 # One-time test run instead of a recurring schedule. Use the 24-hour clock.
 # export_schedule = "at(2026-11-12T05:00:00)"

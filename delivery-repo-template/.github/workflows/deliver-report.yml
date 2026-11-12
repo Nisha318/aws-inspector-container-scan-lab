@@ -101,6 +101,12 @@ jobs:
             links="${links}  ${BASE_URL}/${d}"$'\n'
           done
           report_date="${FOLDERS##* }"; report_date="${report_date##*/}"
+          count=$(printf '%s\n' $FILES | wc -l)
+          if [ "$count" -ge 2 ]; then
+            note="The CSV opens in a spreadsheet. The JSON is for tooling. Both come from the same scan."
+          else
+            note="Only one format arrived this run. If a second format was expected, its export may have failed and the operators have been told."
+          fi
           subject="Inspector findings delivered: ${CUSTOMER}, ${report_date}"
           message="New Amazon Inspector container scan reports were delivered.
 
@@ -112,7 +118,7 @@ jobs:
           Files:
           $(printf '  %s\n' $FILES)
 
-          Both files come from the same scan. The CSV opens in a spreadsheet. The JSON is for tooling."
+          ${note}"
           aws sns publish --topic-arn "$TOPIC_ARN" --subject "$subject" --message "$message" > /dev/null
           echo "Notified ${TOPIC_ARN}"
 

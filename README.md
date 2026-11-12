@@ -183,7 +183,7 @@ Goal: a CSV and a JSON report land in S3 on a schedule with no one involved.
    export_schedule_timezone = "America/Chicago"
    ```
 
-2. Apply. Expect 5 to add: two schedules, a role, a policy, and a dead-letter queue.
+2. Apply. Expect 5 to add: two schedules, a role, a policy, and a dead-letter queue. The CSV schedule fires at the time you set and the JSON schedule ten minutes later, because Inspector generates one report at a time per account.
 
    ```bash
    terraform apply
@@ -195,7 +195,7 @@ Goal: a CSV and a JSON report land in S3 on a schedule with no one involved.
    aws s3 ls "$(terraform output -raw scheduled_export_prefix)"
    ```
 
-**Checkpoint:** two objects, one `.csv` and one `.json`, each named after an Inspector report ID.
+**Checkpoint:** two objects, one `.csv` and one `.json`, each named after an Inspector report ID. The JSON arrives about ten minutes after the CSV.
 
 ![S3 folder under exports/ containing the reports created by the schedule](docs/images/s3-scheduled-export.png)
 
@@ -350,7 +350,7 @@ It prints claims only, never the token.
 
 **The findings table shows `200+`.** The console caps the count. Filter by severity for an exact number.
 
-**No report after a scheduled export.** Read the dead-letter queue (step 6). An empty queue plus no file usually means the schedule time was in the past when you applied.
+**No report after a scheduled export.** Read the dead-letter queue (step 6). An empty queue plus no file usually means the schedule time was in the past when you applied. `ValidationException: Cannot have multiple reports in-progress` means two report requests overlapped. The lab staggers its own schedules, so this points at a manual export or another tool requesting a report at the same time.
 
 **The delivery workflow is green but no email arrived.** Check `aws sns list-subscriptions` (step 7b) for `PendingConfirmation`, and check that `DELIVERY_TOPIC_ARN` is set on the delivery repository.
 

@@ -35,9 +35,12 @@ variable "export_customer" {
 
 variable "export_report_formats" {
   description = <<-EOT
-    Report formats to export on each run. One schedule is created per format,
-    and all of them fire at the same time. The default produces both a CSV for
-    people and a JSON for tooling. Set to ["CSV"] for a single report.
+    Report formats to export on each run. One schedule is created per format.
+    Inspector generates one report at a time per account, so the schedules are
+    staggered by export_format_stagger_minutes: the first format fires at the
+    time in export_schedule and each later one a few minutes after. The default
+    produces both a CSV for people and a JSON for tooling. Set to ["CSV"] for a
+    single report.
   EOT
   type        = set(string)
   default     = ["CSV", "JSON"]
@@ -48,11 +51,41 @@ variable "export_report_formats" {
   }
 }
 
+variable "export_format_stagger_minutes" {
+  description = "Minutes between one format's export and the next. Inspector rejects a report request while another is in progress, and a report takes under a minute for a few hundred findings."
+  type        = number
+  default     = 10
+
+  validation {
+    condition     = var.export_format_stagger_minutes >= 1 && var.export_format_stagger_minutes <= 20
+    error_message = "export_format_stagger_minutes must be between 1 and 20."
+  }
+}
+
 locals {
   enable_scheduled_export = var.export_schedule != ""
 
   # Empty when the schedule is off, so for_each creates nothing.
   export_formats = local.enable_scheduled_export ? var.export_report_formats : toset([])
+
+  # Stable order so CSV is always first: CSV at +0, JSON at +stagger.
+  export_format_offset = { for i, f in sort(tolist(local.export_formats)) : f => i * var.export_format_stagger_minutes }
+
+  # Shift the user's expression by each format's offset. cron(M H ...) gets M
+  # advanced; at(timestamp) gets the timestamp advanced. rate() cannot be
+  # offset, so it is only accepted with a single format (see the precondition).
+  schedule_is_cron = can(regex("^cron\\((\\d{1,2}) (.+)\\)$", var.export_schedule))
+  schedule_is_at   = can(regex("^at\\((.+)\\)$", var.export_schedule))
+  cron_parts       = local.schedule_is_cron ? regex("^cron\\((\\d{1,2}) (.+)\\)$", var.export_schedule) : ["0", ""]
+  at_timestamp     = local.schedule_is_at ? regex("^at\\((.+)\\)$", var.export_schedule)[0] : "1970-01-01T00:00:00"
+
+  export_schedule_expressions = {
+    for f, off in local.export_format_offset : f => (
+      local.schedule_is_cron ? format("cron(%d %s)", tonumber(local.cron_parts[0]) + off, local.cron_parts[1]) :
+      local.schedule_is_at ? format("at(%s)", trimsuffix(timeadd("${local.at_timestamp}Z", "${off}m"), "Z")) :
+      var.export_schedule
+    )
+  }
 }
 
 data "aws_iam_policy_document" "export_scheduler_trust" {
@@ -115,14 +148,22 @@ resource "aws_iam_role_policy" "export_scheduler" {
   policy = data.aws_iam_policy_document.export_scheduler[0].json
 }
 
-# One schedule per format. They share the role and dead-letter queue above and
-# fire at the same minute, so each run leaves one file per format in the bucket.
+# One schedule per format. They share the role and dead-letter queue above.
+# Inspector allows one report generation at a time per account, so the
+# schedules are staggered a few minutes apart rather than firing together.
 resource "aws_scheduler_schedule" "export" {
   for_each = local.export_formats
 
   name                         = "${var.project_name}-findings-export-${lower(each.key)}"
-  schedule_expression          = var.export_schedule
+  schedule_expression          = local.export_schedule_expressions[each.key]
   schedule_expression_timezone = var.export_schedule_timezone
+
+  lifecycle {
+    precondition {
+      condition     = length(local.export_formats) == 1 || local.schedule_is_at || (local.schedule_is_cron && tonumber(local.cron_parts[0]) + max(values(local.export_format_offset)...) <= 59)
+      error_message = "With more than one export format, export_schedule must be a cron() expression whose minute is a plain number small enough that minute + stagger stays under 60, or an at() expression. rate() expressions cannot be staggered."
+    }
+  }
 
   flexible_time_window {
     mode = "OFF"
