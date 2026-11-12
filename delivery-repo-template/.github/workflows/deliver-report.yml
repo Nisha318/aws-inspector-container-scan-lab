@@ -66,6 +66,7 @@ jobs:
       # exits 0 without changing anything when the newest reports are already
       # filed, so a scheduled run with nothing new produces no commit.
       - name: Fetch the newest reports from the staging bucket
+        id: fetch
         env:
           REPORT_BUCKET: ${{ vars.REPORT_BUCKET }}
           REPORT_PREFIX: ${{ vars.REPORT_PREFIX }}
@@ -82,3 +83,56 @@ jobs:
           fi
           git commit -m "Deliver Inspector findings reports $(date -u +%Y-%m-%d)"
           git push
+
+      # Runs only when something was delivered and a topic is configured, so a
+      # run that finds nothing new sends nothing. The link points at the dated
+      # folder on this server, which works on github.com and on GHES alike.
+      - name: Email the readers a link to the new reports
+        if: steps.fetch.outputs.delivered != '0' && vars.DELIVERY_TOPIC_ARN != ''
+        env:
+          TOPIC_ARN: ${{ vars.DELIVERY_TOPIC_ARN }}
+          CUSTOMER: ${{ steps.fetch.outputs.customer }}
+          FOLDERS: ${{ steps.fetch.outputs.folders }}
+          FILES: ${{ steps.fetch.outputs.files }}
+          BASE_URL: ${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}
+        run: |
+          links=""
+          for d in $FOLDERS; do
+            links="${links}  ${BASE_URL}/${d}"$'\n'
+          done
+          report_date="${FOLDERS##* }"; report_date="${report_date##*/}"
+          subject="Inspector findings delivered: ${CUSTOMER}, ${report_date}"
+          message="New Amazon Inspector container scan reports were delivered.
+
+          Customer:     ${CUSTOMER}
+          Report date:  ${report_date}
+
+          Folder:
+          ${links}
+          Files:
+          $(printf '  %s\n' $FILES)
+
+          Both files come from the same scan. The CSV opens in a spreadsheet. The JSON is for tooling."
+          aws sns publish --topic-arn "$TOPIC_ARN" --subject "$subject" --message "$message" > /dev/null
+          echo "Notified ${TOPIC_ARN}"
+
+      # Runs only when an earlier step failed. If the failure was in the
+      # credentials step itself there are no AWS credentials to publish with,
+      # and this step fails too. GitHub still emails the workflow's last
+      # committer for any failed scheduled run, so that case is not silent.
+      - name: Email the operators that delivery failed
+        if: failure() && vars.OPS_TOPIC_ARN != ''
+        env:
+          TOPIC_ARN: ${{ vars.OPS_TOPIC_ARN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          aws sns publish --topic-arn "$TOPIC_ARN" \
+            --subject "Inspector report delivery FAILED: ${REPO}" \
+            --message "The delivery workflow in ${REPO} failed.
+
+          Run: ${RUN_URL}
+
+          Open the run to see which step failed. Common causes are an expired or
+          mismatched OIDC trust policy, a missing repository variable, or a report
+          that could not be decrypted." > /dev/null
