@@ -21,6 +21,10 @@
 #   REPORT_PREFIX  Customer folder inside the bucket, for example exports/team-a/
 #                  The last path segment names the customer.
 # Credentials come from the OIDC role the workflow assumed.
+#
+# When run inside GitHub Actions, the script also records what it delivered as
+# step outputs (customer, delivered, folders, files) so a later step can build
+# a notification. Outside Actions, GITHUB_OUTPUT is unset and nothing is written.
 
 set -euo pipefail
 
@@ -49,6 +53,8 @@ mkdir -p "$SCAN_DIR"
 touch "$STATE_FILE"
 
 delivered=0
+folders=""
+files=""
 
 for EXT in csv json; do
   # Newest object with this extension under the prefix. The CLI pages through
@@ -92,9 +98,25 @@ for EXT in csv json; do
 
   echo "$KEY" >> "$STATE_FILE"
   delivered=$((delivered + 1))
+  case " $folders " in *" $DEST_DIR "*) ;; *) folders="${folders:+$folders }$DEST_DIR" ;; esac
+  files="${files:+$files
+}$(basename "$DEST_FILE")"
   echo "Delivered ${DEST_FILE}"
 done
 
 if [ "$delivered" -eq 0 ]; then
   echo "Nothing new to deliver."
+fi
+
+# Hand the summary to the workflow. The files value spans several lines, so it
+# uses the heredoc form that GITHUB_OUTPUT accepts for multi-line values.
+if [ -n "${GITHUB_OUTPUT:-}" ]; then
+  {
+    echo "customer=${CUSTOMER}"
+    echo "delivered=${delivered}"
+    echo "folders=${folders}"
+    echo "files<<EOF"
+    echo "${files}"
+    echo "EOF"
+  } >> "$GITHUB_OUTPUT"
 fi

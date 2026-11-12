@@ -4,7 +4,7 @@ Deploy a small AWS environment with Terraform, push intentionally outdated conta
 
 The lab came from a real request: a cyber team needed Inspector scan results for container images, and they have no access to the AWS console. A report in an S3 bucket doesn't help them, because they can't open the bucket either. The real goal is delivering the findings to the cyber team outside AWS, automatically, on a schedule.
 
-The lab builds both halves. Inspector scans the images, and a scheduled export writes the reports to an encrypted S3 bucket, which acts as a staging point. Then a GitHub Actions workflow in a second repository, one the cyber team can read, assumes a read-only role through OIDC, downloads the newest reports, and commits them into a folder named for the date they were generated. [Step 7](#step-7-deliver-the-reports-to-a-github-repository) builds that second repository from the template in `delivery-repo-template/`.
+The lab builds both halves. Inspector scans the images, and a scheduled export writes the reports to an encrypted S3 bucket, which acts as a staging point. Then a GitHub Actions workflow in a second repository, one the cyber team can read, assumes a read-only role through OIDC, downloads the newest reports, commits them into a folder named for the date they were generated, and emails the cyber team a link. [Step 7](#step-7-deliver-the-reports-to-a-github-repository) builds that second repository from the template in `delivery-repo-template/`.
 
 ![Architecture and data flow](docs/images/architecture.png)
 
@@ -66,11 +66,13 @@ This lab sets registry scanning to continuous, but it scopes the filter to repos
 ├── github_oidc.tf           Optional OIDC role for the Actions workflow
 ├── scheduled_export.tf      Optional scheduled findings export, one schedule per format
 ├── delivery_role.tf         Optional read-only role for the delivery workflow (step 7), off by default
+├── notifications.tf         Optional SNS topics and dead-letter queue alarm for step 7, off by default
 ├── delivery-repo-template/  Contents of the repository that receives the reports (step 7)
 │   ├── README.md            Setup steps and what readers will find
 │   ├── scripts/fetch-latest-report.sh
 │   └── .github/workflows/deliver-report.yml
 ├── outputs.tf
+├── terraform.tfvars.example Every variable, grouped by step. Copy to terraform.tfvars
 ├── scripts/
 │   ├── push-images.sh       Pushes the outdated images (option A)
 │   └── export-report.sh     Optional manual export from the CLI
@@ -82,7 +84,7 @@ This lab sets registry scanning to continuous, but it scopes the filter to repos
 
 ## Step 1: Deploy the infrastructure
 
-Create a `terraform.tfvars` file. It is gitignored, so your account details stay out of the repo. Start with the minimum:
+Create a `terraform.tfvars` file. It is gitignored, so your account details stay out of the repo. `terraform.tfvars.example` lists every variable the lab accepts, grouped by step, with the optional ones commented out. Copy it and edit, or start with the minimum:
 
 ```hcl
 aws_region = "us-east-1"
@@ -341,9 +343,42 @@ If the delivery repository lives on GitHub Enterprise Server rather than github.
 
 ### The GitHub side
 
-Create a new private repository and copy the contents of `delivery-repo-template/` into it. The template's README walks through the rest: four repository variables (`AWS_ROLE_ARN`, `AWS_REGION`, `REPORT_BUCKET`, `REPORT_PREFIX`), the cron schedule, and a first manual run. Give the cyber team read access and you are done.
+Create a private repository, or pick an existing one the cyber team can read, and put the template in it. From the folder that holds your clone of the lab:
 
-The workflow is short. It assumes the role with `aws-actions/configure-aws-credentials`, runs `scripts/fetch-latest-report.sh`, and commits whatever the script wrote. The script records every delivered object key in a `.delivered` file, so a scheduled run that finds nothing new changes no files and the workflow makes no commit. That makes a daily delivery check harmless even when the export itself runs monthly.
+```bash
+gh repo create OWNER/REPO --private --clone
+cp -r aws-inspector-container-scan-lab/delivery-repo-template/. REPO/
+cd REPO && git add -A && git commit -m "Add Inspector findings delivery workflow" && git push -u origin main
+```
+
+For an existing repository, copy `.github/workflows/deliver-report.yml` and `scripts/fetch-latest-report.sh` into it and commit. Then record the IDs the trust policy needs, and put them in `terraform.tfvars` alongside `delivery_repo`:
+
+```bash
+gh api repos/OWNER/REPO --jq '{owner: .owner.id, repo: .id}'
+```
+
+```hcl
+delivery_subject_override = ["repo:OWNER@OWNER_ID/REPO@REPO_ID:ref:refs/heads/main"]
+```
+
+The template's README walks through the rest: six repository variables (`AWS_ROLE_ARN`, `AWS_REGION`, `REPORT_BUCKET`, `REPORT_PREFIX`, and the two optional topic ARNs), the cron schedule, and a first manual run. Give the cyber team read access and you are done.
+
+The workflow is short. It assumes the role with `aws-actions/configure-aws-credentials`, runs `scripts/fetch-latest-report.sh`, commits whatever the script wrote, and publishes a notification. The script records every delivered object key in a `.delivered` file, so a scheduled run that finds nothing new changes no files, makes no commit, and sends no email. That makes a daily delivery check harmless even when the export itself runs monthly.
+
+### Telling people
+
+`notifications.tf` adds two SNS topics, each created only when its email list is set:
+
+```hcl
+delivery_notify_emails = ["cyber-team@example.com"]
+ops_notify_emails      = ["cloud-team@example.com"]
+```
+
+The **delivery** topic is for readers. After the workflow commits new reports, it publishes a plain-text message with the customer, the report date, a link to the dated folder, and the file names. The link is built from the workflow's own server and repository, so it is correct on github.com and on GitHub Enterprise Server.
+
+The **ops** topic is for the team that runs the pipeline, and it only ever carries bad news. A CloudWatch alarm on the dead-letter queue fires when a scheduled export fails after its retries. A final step in the delivery workflow, guarded by `if: failure()`, publishes the run URL when any earlier step failed. Silence on this topic means every run succeeded, and the readers' silence on an expected day is something you already know about.
+
+Every subscriber receives a confirmation email from AWS Notifications after the apply and must click the link in it. The delivery role gets `sns:Publish` on exactly these two topics through a second inline policy, so `delivery_role.tf` keeps its read-only shape.
 
 ### Why the date can differ from the export time
 

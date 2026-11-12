@@ -1,0 +1,47 @@
+# Copy to terraform.tfvars and edit. terraform.tfvars is gitignored.
+#
+# Every line below the "Core" block is optional. Each feature stays off until
+# its variable is set, so you can follow the README one step at a time and
+# uncomment as you go.
+
+# --- Core (step 1) -----------------------------------------------------------
+
+aws_region = "us-east-1"
+
+# Set to false if the pre-flight checks showed these already exist in the account.
+manage_inspector            = true
+create_github_oidc_provider = true
+
+# --- GitHub Actions push (step 2, option B) ----------------------------------
+
+# github_repo = "YOUR-USERNAME/aws-inspector-container-scan-lab"
+
+# Repositories created on github.com after July 15, 2026 need both IDs.
+# Find them with: gh api repos/OWNER/REPO --jq '{owner: .owner.id, repo: .id}'
+# github_owner_id = "12345678"
+# github_repo_id  = "987654321"
+
+# --- Scheduled export (step 6) -----------------------------------------------
+
+# Reports land under exports/<export_customer>/ in the bucket.
+# export_customer          = "team-a"
+# export_schedule          = "cron(0 4 ? * MON *)"   # Mondays at 04:00 in the time zone below
+# export_schedule_timezone = "America/Chicago"
+# export_report_formats    = ["CSV", "JSON"]         # the default. ["CSV"] for one file per run
+
+# One-time test run instead of a recurring schedule. Use the 24-hour clock.
+# export_schedule = "at(2026-11-12T05:00:00)"
+
+# --- Delivery to a GitHub repository (step 7) --------------------------------
+
+# delivery_repo             = "OWNER/REPO"
+# delivery_subject_override = ["repo:OWNER@OWNER_ID/REPO@REPO_ID:ref:refs/heads/main"]
+
+# GitHub Enterprise Server only. The OIDC provider for this URL must already exist.
+# delivery_oidc_url = "https://YOUR-GHES-HOST/_services/token"
+
+# --- Notifications (step 7) --------------------------------------------------
+
+# Each address gets a confirmation email from AWS and must click it.
+# delivery_notify_emails = ["cyber-team@example.com"]   # readers: new reports landed
+# ops_notify_emails      = ["cloud-team@example.com"]   # operators: export or delivery failed
