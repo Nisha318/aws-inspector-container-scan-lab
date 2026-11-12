@@ -1,411 +1,326 @@
 # AWS Inspector Container Scan Lab
 
-Deploy a small AWS environment with Terraform, push intentionally outdated container images into Amazon ECR, and watch Amazon Inspector find the vulnerabilities. Then triage the findings, and export the report to an encrypted S3 bucket, either by hand in the console or automatically on a schedule.
-
-The lab came from a real request: a cyber team needed Inspector scan results for container images, and they have no access to the AWS console. A report in an S3 bucket doesn't help them, because they can't open the bucket either. The real goal is delivering the findings to the cyber team outside AWS, automatically, on a schedule.
-
-The lab builds both halves. Inspector scans the images, and a scheduled export writes the reports to an encrypted S3 bucket, which acts as a staging point. Then a GitHub Actions workflow in a second repository, one the cyber team can read, assumes a read-only role through OIDC, downloads the newest reports, commits them into a folder named for the date they were generated, and emails the cyber team a link. [Step 7](#step-7-deliver-the-reports-to-a-github-repository) builds that second repository from the template in `delivery-repo-template/`.
+Push two outdated container images into Amazon ECR, let Amazon Inspector find the vulnerabilities, export the findings to S3 on a schedule, and deliver them to a team that has no AWS access by committing the reports into a GitHub repository and emailing a link.
 
 ![Architecture and data flow](docs/images/architecture.png)
 
-## What you build
+This README is the walkthrough: what to type, what to click, and how to tell each step worked. The reasoning behind the design, the IAM policies, and the console tour live in [docs/how-it-works.md](docs/how-it-works.md).
 
-| Piece | What it does |
-| --- | --- |
-| Two ECR repositories | Hold the outdated images (`legacy-nginx`, `legacy-python`) |
-| Inspector enhanced scanning | Scans images on push and keeps rescanning as new CVEs are published |
-| KMS key and S3 bucket | Receive the findings report. Inspector requires a customer-managed key |
-| GitHub OIDC role (optional) | Lets a GitHub Actions workflow push images with no stored access keys |
-| EventBridge Scheduler (optional) | Requests the findings report on a schedule, with no Lambda function or custom code |
-| SQS dead-letter queue (optional) | Catches the error when a scheduled export fails after its retries. An empty queue means every run succeeded |
+## Contents
 
-Terraform builds everything except the images. You push those yourself in step 2, which mirrors how developers deliver images to ECR in real pipelines. Triage and suppression rules in step 4 are console exercises, so Terraform does not manage them.
+| Step | What you do | Time | Needed for |
+| --- | --- | --- | --- |
+| [0](#step-0-prerequisites) | Install tools, run pre-flight checks | 15 min | everything |
+| [1](#step-1-deploy-the-infrastructure) | Deploy with Terraform | 5 min | everything |
+| [2](#step-2-push-the-outdated-images) | Push the images to ECR | 5 min | everything |
+| [3](#step-3-confirm-inspector-found-the-vulnerabilities) | Confirm Inspector scanned them | 10 min wait | everything |
+| [4](#step-4-optional-suppress-low-severity-findings) | Suppress low findings | 5 min | optional |
+| [5](#step-5-export-a-findings-report-by-hand) | Export a report from the console | 5 min | optional, teaches step 6 |
+| [6](#step-6-export-automatically-on-a-schedule) | Export on a schedule | 10 min | step 7 |
+| [7](#step-7-deliver-the-reports-to-a-github-repository) | Deliver to a GitHub repo and email a link | 20 min | the full pipeline |
+| [8](#step-8-clean-up) | Destroy everything | 5 min | your wallet |
 
-## Before you start
+Steps 1 through 3 are the core lab. Steps 6 and 7 together are the automated delivery pipeline. Budget about 90 minutes for all of it, most of that waiting on Inspector.
 
-You need:
+**Cost.** Inspector has a 15-day free trial for new accounts. After that, ECR scanning is billed per image scanned. Everything else is pennies. Do step 8 when you finish.
 
-- An AWS account you control, and the AWS CLI configured for it
-- Terraform 1.5 or later, or OpenTofu
-- For step 2, either Docker with a Bash shell (Git Bash works on Windows) or a fork of this repo with GitHub Actions enabled
-- The GitHub CLI (`gh`) if you use the Actions option
+## Step 0: Prerequisites
 
-**Cost.** Inspector includes a 15-day free trial for new accounts. After that, ECR scanning is billed per image scanned and per rescan. The other resources cost pennies per month. Run the cleanup step when you finish.
+Install:
 
-### Pre-flight checks
+| Tool | Download | Needed for |
+| --- | --- | --- |
+| AWS CLI v2 | [aws.amazon.com/cli](https://aws.amazon.com/cli/) | everything |
+| Terraform 1.5+ | [developer.hashicorp.com/terraform/install](https://developer.hashicorp.com/terraform/install) | everything (or OpenTofu, below) |
+| OpenTofu | [opentofu.org/docs/intro/install](https://opentofu.org/docs/intro/install/) | alternative to Terraform. Replace `terraform` with `tofu` in every command |
+| Git | [git-scm.com/downloads](https://git-scm.com/downloads) | everything. On Windows, use the Git Bash shell it installs |
+| GitHub CLI (`gh`) | [cli.github.com](https://cli.github.com/) | steps 2 (option B) and 7 |
+| Docker Desktop | [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/) | step 2 (option A) only |
 
-Inspector and the GitHub OIDC provider are account-wide settings, and AWS allows only one of each. Run these first so Terraform doesn't collide with something that already exists.
+You also need an AWS account you control, with the CLI configured for it (`aws configure`), and a GitHub account. Log the GitHub CLI in with `gh auth login`.
+
+Then clone this repository and run the pre-flight checks:
 
 ```bash
-# Is Inspector already enabled for ECR? Look for "ECR": {"status": "ENABLED"}
-aws inspector2 batch-get-account-status
+git clone https://github.com/Nisha318/aws-inspector-container-scan-lab.git
+cd aws-inspector-container-scan-lab
 
-# Does the account already have the GitHub OIDC provider?
-aws iam list-open-id-connect-providers
-
-# What is the current ECR scanning configuration?
-aws ecr get-registry-scanning-configuration
+aws inspector2 batch-get-account-status --query 'accounts[0].resourceState.ecr.status' --output text
+aws iam list-open-id-connect-providers --query 'OpenIDConnectProviderList[].Arn' --output text
 ```
 
-What the results mean for your settings:
+Note the two answers. They set two values in the next step.
 
-- If ECR scanning is already enabled, set `manage_inspector = false` in `terraform.tfvars`. Terraform will then leave the account-wide Inspector settings alone.
-- If the list of OIDC providers includes `token.actions.githubusercontent.com`, set `create_github_oidc_provider = false`. Terraform will look it up instead of creating a second one.
-
-This lab sets registry scanning to continuous, but it scopes the filter to repositories under `inspector-lab/`, so other repositories in the account are not affected by the filter.
-
-## Repository layout
-
-```
-.
-├── providers.tf             AWS provider and shared lookups
-├── variables.tf             Core inputs
-├── inspector.tf             Enables Inspector and sets ECR scanning
-├── ecr.tf                   The two lab repositories
-├── storage.tf               KMS key and report bucket, with Inspector's access policies
-├── github_oidc.tf           Optional OIDC role for the Actions workflow
-├── scheduled_export.tf      Optional scheduled findings export, one schedule per format
-├── delivery_role.tf         Optional read-only role for the delivery workflow (step 7), off by default
-├── notifications.tf         Optional SNS topics and dead-letter queue alarm for step 7, off by default
-├── delivery-repo-template/  Contents of the repository that receives the reports (step 7)
-│   ├── README.md            Setup steps and what readers will find
-│   ├── scripts/fetch-latest-report.sh
-│   └── .github/workflows/deliver-report.yml
-├── outputs.tf
-├── terraform.tfvars.example Every variable, grouped by step. Copy to terraform.tfvars
-├── scripts/
-│   ├── push-images.sh       Pushes the outdated images (option A)
-│   └── export-report.sh     Optional manual export from the CLI
-├── .github/workflows/
-│   ├── push-images.yml      Pushes the outdated images (option B)
-│   └── export-report.yml    Optional manual export from Actions
-└── docs/images/             Diagrams and screenshots used in this README
-```
+**Checkpoint:** both commands return without an error.
 
 ## Step 1: Deploy the infrastructure
 
-Create a `terraform.tfvars` file. It is gitignored, so your account details stay out of the repo. `terraform.tfvars.example` lists every variable the lab accepts, grouped by step, with the optional ones commented out. Copy it and edit, or start with the minimum:
+1. Copy the example variables file and open it:
 
-```hcl
-aws_region = "us-east-1"
+   ```bash
+   cp terraform.tfvars.example terraform.tfvars
+   ```
 
-# Set to false if the pre-flight checks showed these already exist
-manage_inspector            = true
-create_github_oidc_provider = true
-```
+   `terraform.tfvars` is gitignored. Your account details never reach the repo.
 
-If you plan to use the GitHub Actions option in step 2, add your repository:
+2. In the **Core** block, set two values from the pre-flight checks:
 
-```hcl
-github_repo = "YOUR-USERNAME/aws-inspector-container-scan-lab"
-```
+   | Pre-flight answer | Set |
+   | --- | --- |
+   | Inspector status was `ENABLED` | `manage_inspector = false` |
+   | Provider list included `token.actions.githubusercontent.com` | `create_github_oidc_provider = false` |
 
-Repositories created after July 15, 2026 send an OIDC subject that includes immutable numeric IDs for the owner and the repo. The IAM trust policy needs those IDs, so look them up and add them:
+   Otherwise leave both `true`.
 
-```bash
-gh api repos/YOUR-USERNAME/aws-inspector-container-scan-lab --jq '{owner: .owner.id, repo: .id}'
-```
+3. If you will push images with GitHub Actions in step 2 (option B), fork this repository, then in the **GitHub Actions push** block set `github_repo` to your fork and fill in the two IDs:
 
-```hcl
-github_owner_id = "12345678"
-github_repo_id  = "987654321"
-```
+   ```bash
+   gh api repos/YOUR-USERNAME/aws-inspector-container-scan-lab --jq '{owner: .owner.id, repo: .id}'
+   ```
 
-Older repositories that still use the plain subject format can leave both IDs out. Set both or neither.
+   Repositories created after July 15, 2026 need the IDs. Older ones can leave both out.
 
-Then deploy:
+4. Deploy:
 
-```bash
-terraform init
-terraform plan
-terraform apply
-```
+   ```bash
+   terraform init
+   terraform apply
+   ```
 
-Keep the outputs handy. You will use `ecr_repository_urls`, `report_bucket`, `report_kms_key_arn`, and (if you set `github_repo`) `github_actions_role_arn`.
+**Checkpoint:** `Apply complete!` with 9 to 14 resources added, and an `ecr_repository_urls` output listing two repositories.
 
 ## Step 2: Push the outdated images
 
-Terraform creates the repositories but leaves them empty. Pick one option.
+Pick one option.
 
-### Option A: Run the script
+**Option A, from your computer.** Needs Docker running.
 
 ```bash
 bash scripts/push-images.sh
 ```
 
-The script logs in to ECR, pulls `nginx:1.21.6` and `python:3.9.7-slim-bullseye` for `linux/amd64`, retags them, and pushes. It needs a running Docker daemon. If you deployed to another region or changed `project_name`, set `AWS_REGION` and `PROJECT_NAME` first.
+**Option B, from GitHub Actions.** Needs the fork and `github_repo` from step 1. Set two repository variables on your fork, then run the workflow:
 
-### Option B: Run the GitHub Actions workflow
+```bash
+gh variable set AWS_ROLE_ARN --body "$(terraform output -raw github_actions_role_arn)"
+gh variable set AWS_REGION   --body "$(terraform output -raw aws_region)"
+gh workflow run push-images.yml
+gh run watch
+```
 
-This option needs no Docker or Bash on your computer.
-
-1. Set the repository variables, using the role ARN from the Terraform outputs:
-
-   ```bash
-   gh variable set AWS_ROLE_ARN --body "arn:aws:iam::123456789012:role/inspector-lab-github-actions-push"
-   gh variable set AWS_REGION   --body "us-east-1"
-   ```
-
-2. In the repository, open **Actions**, choose **Push lab images to ECR**, and click **Run workflow**.
+**Checkpoint:** either the script prints two `Pushed` lines, or the workflow run is green.
 
 ![Completed GitHub Actions run that pushed the lab images to ECR](docs/images/github-actions-push-success.png)
 
-The workflow requests a GitHub OIDC token and exchanges it for short-lived AWS credentials. No access keys are stored anywhere. If the login fails with `Not authorized to perform sts:AssumeRoleWithWebIdentity`, the cause is almost always a mismatch between the token subject and the role's trust policy. See [Troubleshooting](#troubleshooting).
+If the workflow fails at "Assume the lab IAM role," see [Troubleshooting](#troubleshooting).
 
-Workflow logs on a public repository are public. Both workflows mask your AWS account ID, so the bucket name and KMS key ARN print with `***` where the 12 digits would be. If you fork this into a public repo, keep that masking in place.
+## Step 3: Confirm Inspector found the vulnerabilities
 
-## Step 3: Watch Inspector scan the images
+Inspector needs a few minutes after the push. Poll until both images show `ACTIVE`:
 
-Give Inspector a few minutes after the push finishes. Then look at the results in three places.
+```bash
+aws inspector2 list-coverage --filter-criteria '{"resourceType":[{"comparison":"EQUALS","value":"AWS_ECR_CONTAINER_IMAGE"}]}' --query 'coveredResources[].[resourceMetadata.ecrImage.tags[0],scanStatus.statusCode]' --output table
+```
 
-**In ECR.** Open **Amazon ECR**, then **Private registry**, then **Repositories**. Open `inspector-lab/legacy-nginx` and click the image tag. The page shows the scan status, the time of the last scan, and the severity counts, followed by a table of every vulnerability on that image. Each row shows the CVE name, the vulnerable package, the severity, the version that fixes it, and whether an exploit or a fix is available. Click a CVE name to read its full details. The **See extended details in Inspector** link on the same page opens the matching finding in Inspector.
+Then count the findings:
 
-![ECR image page listing the vulnerabilities on the nginx image, with severity counts and fix availability](docs/images/ecr-image-vulnerabilities.png)
+```bash
+aws inspector2 list-findings --filter-criteria '{"ecrImageRepositoryName":[{"comparison":"PREFIX","value":"inspector-lab/"}],"findingStatus":[{"comparison":"EQUALS","value":"ACTIVE"}]}' --max-results 1 --query 'length(findings)'
+```
 
-**On the Inspector dashboard.** Open **Amazon Inspector** and stay on the **Summary** page. It shows active findings by severity, plus two numbers that matter for prioritizing: how many findings have a public exploit available, and how many have a fix available.
+**Checkpoint:** the count is `1` (meaning at least one). In the console, **Amazon ECR**, **Repositories**, `inspector-lab/legacy-nginx`, click the image tag, and you see a vulnerability table with severity counts. The lab run produced 566 findings across both images. Yours will differ.
 
-![Inspector dashboard showing critical findings, public exploit counts, and fix counts](docs/images/inspector-dashboard-overview.png)
+![ECR image page listing the vulnerabilities on the nginx image](docs/images/ecr-image-vulnerabilities.png)
 
-Scroll down to see which images carry the most critical findings.
+Where to look next, and how to read severity, fix availability, and exploit availability: [how-it-works.md, Reading the findings](docs/how-it-works.md#reading-the-findings).
 
-![Inspector dashboard table of container images with the most critical findings](docs/images/inspector-top-critical-images.png)
+## Step 4 (optional): Suppress low severity findings
 
-**In the Findings list.** Choose **Findings** in the left navigation. Open one finding and look at the CVE, the affected package, the fixed-in version, and the exploit and score details. This is the information a team needs to decide what to patch.
+1. In **Amazon Inspector**, open **Findings**. Set **Finding status** to **Active** and add the filter **Severity: Low**. Note the count.
+2. Choose **Create suppression rule**. Name it, confirm the filter shows **Severity: Low**, and **Save**.
+3. Refresh the Findings page every minute or so.
 
-![Inspector finding detail showing the CVE, affected package, and fixed-in version](docs/images/inspector-finding-detail.png)
+**Checkpoint:** the Active low count falls to zero, and the same findings appear under **Finding status: Suppressed**.
 
-When this lab was built, the two images produced 566 active findings. That included 52 critical, 232 high, 249 medium, and 25 low. The nginx image carried 340 findings and the Python image carried 226. Your numbers will differ as the vulnerability database changes.
+![Success banner after the suppression rule is created](docs/images/suppression-rule-created.png)
 
-Why these images? Inspector gives full findings only for operating systems it supports for ECR scanning, such as Debian 11 and later. Images on discontinued operating systems produce only limited informational findings, which makes a weak demo.
+Suppressed findings are left out of every report from here on, including the scheduled exports. Delete the rule under **Suppression rules** to put them back.
 
-### How to read what you see
+## Step 5: Export a findings report by hand
 
-- **Severity** tells you how serious a vulnerability is. Critical and high findings need attention first. Low findings can usually wait for routine maintenance.
-- **Fix available** means a patched version of the package exists. In the lab run, 450 of 566 findings had a fix, which is about 80 percent. For container images, the usual fix is to rebuild on a newer base image.
-- **Public exploit available** means working exploit code is known to exist. In the lab run, that was 224 findings. A critical finding with a public exploit and a fix available goes to the top of the list.
-- **No fix available** is a different decision. You may accept the risk, add a control around it, or wait for the vendor.
+This is the manual version of what step 6 automates. Do it once to see what the report looks like.
 
-## Step 4: Triage and suppress findings
+1. In **Amazon Inspector**, open **Findings** and choose **Export findings** (top right).
+2. Pick **CSV**.
+3. S3 destination: the bucket from `terraform output report_bucket`.
+4. KMS key: `alias/inspector-lab-report`.
+5. Choose **Export** and wait for the success banner.
 
-A real team cannot work through hundreds of findings at once. Inspector lets you create a **suppression rule** that hides findings matching a filter, so the list shows what you want to act on.
+Then download it:
 
-This step uses a simple rule on severity so you can see the effect clearly. In real use, narrower rules such as "no fix available" are usually a better choice.
+```bash
+aws s3 ls "s3://$(terraform output -raw report_bucket)/" --recursive
+aws s3 cp "s3://$(terraform output -raw report_bucket)/<key from the listing>" findings.csv
+```
 
-1. In Inspector, open **Findings**. Set the **Finding status** to **Active** and add the filter **Severity: Low**. Note the count in the heading. In the lab run it was 25.
-2. Choose **Create suppression rule**. Enter a name and description, such as "Suppress low severity findings," and confirm the filter shows **Severity: Low**.
-3. Choose **Save**.
-
-![Findings list, status Active, with 25 low severity findings before the rule](docs/images/findings-low-before-rule.png)
-
-![Suppression rule dialog with the Severity filter options open](docs/images/suppression-rule-filter-dropdown.png)
-
-![Suppression rule dialog with the Severity: Low filter applied](docs/images/suppression-rule-low-filter.png)
-
-Inspector applies the rule in the background. Refresh the Findings page every minute or so. The count of Active low findings falls in steps until it reaches zero. Then change the **Finding status** to **Suppressed** and the same findings appear there.
-
-![Success banner after the rule is created, with the findings list still showing the low findings](docs/images/suppression-rule-created.png)
-
-[Watch a short walkthrough of this step](https://youtu.be/EbShjNcKJtE)
-
-A note on counts: the findings table stops counting at 200 and shows **200+**, so an unfiltered total cannot show a before and after. Filter on severity as above and the count stays exact.
-
-**Suppressed does not mean fixed.** A suppression hides a finding, and the vulnerability is still there. In a real environment, record why you suppressed it, who approved it, and when to review it. Suppressed findings also drop out of any report built from active findings, including the scheduled export in step 6.
-
-## Step 5: Export the findings report to S3
-
-1. In Inspector, open **Findings** and check the **Finding status**. A report of active findings leaves out anything you suppressed in step 4. If you want the full report, delete the suppression rule first under **Suppression rules** and wait for the findings to return to Active.
-2. Choose **Export findings** (top right).
-3. Pick **CSV** (or JSON).
-4. For the S3 destination, enter the bucket from the `report_bucket` output.
-5. For the KMS key, choose the key whose alias is `alias/inspector-lab-report`, or paste `report_kms_key_arn`.
-6. Choose **Export**, and wait for the status to show success.
-
-![Inspector export findings dialog with the S3 bucket and KMS key selected](docs/images/inspector-export-findings.png)
-
-Open the bucket in S3 and download the file. The report is encrypted with the lab key, and S3 decrypts it for you if your own identity has access to the key. Open the CSV in a spreadsheet to see one row per finding, with the severity, whether a fix is available, the package, and the fixed-in version.
+**Checkpoint:** `findings.csv` opens in a spreadsheet with one row per finding.
 
 ![Findings report CSV opened in a spreadsheet](docs/images/csv-report-spreadsheet.png)
 
-Why a customer-managed key? Inspector cannot write a report with the AWS-managed `aws/s3` key, because that key's policy cannot be edited. The key and bucket policies in `storage.tf` allow the Inspector service to write, and they are scoped to your account and to Inspector report ARNs only.
+Excel turns 12-digit account IDs into scientific notation. Import with that column set to Text.
 
-**Spreadsheet tip.** Excel can mangle 12-digit AWS account IDs in CSV files. The first column in the screenshot above shows `#` because the account ID is too wide for the cell and gets converted to scientific notation. Import the file with the account column set to Text.
+To do the same from the CLI or from Actions: `bash scripts/export-report.sh`, or run the **Export Inspector findings to S3** workflow.
 
-### Optional: Run the export from the CLI or Actions
+## Step 6: Export automatically on a schedule
 
-You can also request the same report without the console. These produce a report for the lab repositories only.
+Goal: a CSV and a JSON report land in S3 on a schedule with no one involved.
 
-```bash
-bash scripts/export-report.sh
-```
+1. In `terraform.tfvars`, uncomment the **Scheduled export** block. For the first run, use a one-time schedule a few minutes ahead, 24-hour clock, in the time zone you set:
 
-Or run the **Export Inspector findings to S3** workflow from the Actions tab. Both wait for the report to finish and print where it landed.
+   ```hcl
+   export_customer          = "team-a"
+   export_schedule          = "at(2026-11-12T09:30:00)"
+   export_schedule_timezone = "America/Chicago"
+   ```
 
-## Step 6 (optional): Export automatically on a schedule
+2. Apply. Expect 5 to add: two schedules, a role, a policy, and a dead-letter queue.
 
-This is for the case where the people who need findings can't use the AWS console, or where you want a report on a regular cadence. The report lands in S3, and a separate job has to carry it from there to the readers (see step 7). EventBridge Scheduler calls the Inspector `CreateFindingsReport` API directly, with no Lambda function or custom code. Inspector writes the file using the same bucket and key policies from step 5.
+   ```bash
+   terraform apply
+   ```
 
-Terraform creates two schedules for this step, one that requests a CSV report and one that requests a JSON report, both on the same cron expression. Each run therefore leaves two files in the bucket: a CSV for people to open in a spreadsheet and a JSON for tooling. Set `export_report_formats = ["CSV"]` if you only want one. Alongside the schedules it creates a small IAM role that lets Scheduler call Inspector, and an SQS dead-letter queue. Scheduler retries a failed run twice, an hour apart. If it still fails, the error message goes to the dead-letter queue instead of disappearing. Scheduler has no console page that lists failed runs, so the queue is how you find out. An empty queue means every run succeeded.
+3. When the time passes, check the bucket:
 
-Add these to `terraform.tfvars`:
+   ```bash
+   aws s3 ls "$(terraform output -raw scheduled_export_prefix)"
+   ```
 
-```hcl
-export_schedule          = "cron(0 4 ? * MON *)"   # every Monday at 04:00 in the time zone below
-export_schedule_timezone = "America/Chicago"
-export_customer          = "team-a"                # reports land under exports/team-a/
-```
-
-EventBridge cron has six fields: minute, hour, day of month, month, day of week, and year. A weekly schedule puts `?` in the day-of-month field and a day name in the day-of-week field. For a Sunday night run, use `cron(0 22 ? * SUN *)`. Set the time zone to where the report readers work, and Scheduler handles daylight saving shifts for you.
-
-Then run `terraform apply`. Leave `export_schedule` empty to skip every resource in this feature.
-
-To test without waiting a week, use a one-time schedule a few minutes ahead. Allow time for the apply to finish first, and use the 24-hour clock:
-
-```hcl
-export_schedule = "at(2026-11-02T09:30:00)"
-```
-
-When the time passes, two new reports appear in `exports/<customer>/` in the bucket within a minute or two, one `.csv` and one `.json`, each named after its Inspector report ID. Change the value back to your real schedule afterward and apply again. The report contains active findings for the lab repositories only, so suppressed findings are left out.
+**Checkpoint:** two objects, one `.csv` and one `.json`, each named after an Inspector report ID.
 
 ![S3 folder under exports/ containing the reports created by the schedule](docs/images/s3-scheduled-export.png)
 
-If no report shows up, check the dead-letter queue. A failed run leaves its error there for 14 days.
+If nothing appears after five minutes, the error is in the dead-letter queue:
 
 ```bash
-aws sqs receive-message \
-  --queue-url "$(terraform output -raw export_failure_queue_url)" \
-  --attribute-names All --message-attribute-names All --max-number-of-messages 10
+aws sqs receive-message --queue-url "$(terraform output -raw export_failure_queue_url)" --max-number-of-messages 2
 ```
 
-You can also open the schedule in the EventBridge console and look at its **Monitoring** tab.
+4. Set a real cadence and apply again:
 
-To see what Terraform created, open **Amazon EventBridge**, then **Schedules**. There is one schedule per report format, `inspector-lab-findings-export-csv` and `inspector-lab-findings-export-json`, both on the same cron expression. Select either one. The **Schedule** tab shows the cron fields and the next ten run times in your time zone.
+   ```hcl
+   export_schedule = "cron(0 4 ? * MON *)"   # Mondays at 04:00 in export_schedule_timezone
+   ```
 
-![EventBridge schedule detail showing the cron expression and the next trigger dates](docs/images/eventbridge-schedule-detail.png)
-
-The **Target** tab shows the universal target. The service is Amazon Inspector V2, the API is `CreateFindingsReport`, and the payload carries the filter, the report format, and the S3 destination.
-
-![EventBridge schedule target showing the Inspector CreateFindingsReport API call and its payload](docs/images/eventbridge-schedule-target.png)
-
-The **Dead-letter queue** tab shows the SQS queue that catches failures. The queue has no settings to configure. It stays empty unless a run fails.
-
-![EventBridge schedule dead-letter queue tab showing the SQS queue that receives failed runs](docs/images/eventbridge-schedule-dlq.png)
-
-Each run adds a new file with a generated name. For anything long-running, add an S3 lifecycle rule to expire old reports.
-
-### What the scheduler's IAM role can do
-
-Terraform creates a role named `inspector-lab-export-scheduler` for Scheduler to use. In the IAM console it shows one inline policy, `request-findings-report`, with **Attached entities** at 0. That is normal for an inline policy, which belongs to the role and can't be attached anywhere else. Two parts control it.
-
-**The trust policy** says who may use the role. It names only the Scheduler service (`scheduler.amazonaws.com`) and adds a condition that the request must come from your own account (`aws:SourceAccount`). No person and no other service can assume it.
-
-**The permissions policy** has two statements:
-
-| Statement | Allows | Why |
-| --- | --- | --- |
-| `RequestFindingsReport` | `inspector2:CreateFindingsReport` on `*` | This is the one API call the schedule makes. The action doesn't accept a narrower resource, so the resource is `*` |
-| `ReportFailuresToDeadLetterQueue` | `sqs:SendMessage` on the `inspector-lab-export-failures` queue only | Lets Scheduler drop an error message into the dead-letter queue when a run fails |
-
-Notice what the role does not have. It has no S3 or KMS permissions. Inspector itself writes the report, using the bucket policy and key policy you set up in step 5, which name the Inspector service as the writer. The scheduler role only asks for the report. If the role were stolen, the worst it could do is request more reports.
+Set `export_schedule = ""` to remove everything this step created.
 
 ## Step 7: Deliver the reports to a GitHub repository
 
-The cyber team has no AWS console access, so the reports have to leave AWS on their own. This step builds a second repository that they can read. A workflow in it runs on a schedule, assumes a read-only role in the lab account through OIDC, downloads the newest CSV and JSON reports from the bucket, and commits them under a folder named for the date they were generated:
+Goal: a second, private repository that the readers can open. A workflow in it pulls each new report from S3 and commits it under `<customer>-inspector-scans/<date>/`, then emails the readers a link.
 
-```
-team-a-inspector-scans/
-└── 2026-11-10/
-    ├── findings-<report id>.csv
-    ├── findings-<report id>.json
-    └── SOURCE.txt
-```
+### 7a. Create the delivery repository
 
-This is a pull model. The delivery repository reaches into AWS with short-lived credentials. Nothing in AWS holds a GitHub credential, and nothing in AWS needs to know the repository exists beyond the role's trust policy. The alternative, an S3 event that triggers a `repository_dispatch` call into GitHub, would need a GitHub token stored in AWS and a Lambda function or EventBridge API destination to send it. The pull model needs neither.
-
-### The AWS side
-
-`delivery_role.tf` creates one IAM role and stays off until you set `delivery_repo` in `terraform.tfvars`:
-
-```hcl
-delivery_repo = "my-org/team-a-inspector-findings"
-```
-
-Apply, then note the `delivery_role_arn` output. The role trusts OIDC tokens from that repository's `main` branch only, and its permissions are narrow:
-
-| Statement | Allows | Why |
-| --- | --- | --- |
-| `ListThisCustomersReports` | `s3:ListBucket` on the report bucket, with `s3:prefix` limited to `exports/<customer>/*` | The workflow needs to find the newest objects |
-| `ReadThisCustomersReports` | `s3:GetObject` under `exports/<customer>/` only | Download them |
-| `DecryptReports` | `kms:Decrypt` on the report key | Inspector encrypted them with it |
-
-The role cannot write to the bucket, read another customer's prefix, or call Inspector. Each customer gets their own repository, prefix, and role.
-
-If the delivery repository lives on GitHub Enterprise Server rather than github.com, set `delivery_oidc_url` to `https://YOUR-GHES-HOST/_services/token`. The IAM OIDC provider for that URL must already exist in the account, since `delivery_role.tf` looks it up and never creates it. Repositories created on github.com after July 15, 2026 send the immutable `sub` format, so set `delivery_subject_override` to the real subject. The troubleshooting section shows how to print it.
-
-### The GitHub side
-
-Create a private repository, or pick an existing one the cyber team can read, and put the template in it. From the folder that holds your clone of the lab:
+From the folder that holds your clone of the lab:
 
 ```bash
-gh repo create OWNER/REPO --private --clone
-cp -r aws-inspector-container-scan-lab/delivery-repo-template/. REPO/
-cd REPO && git add -A && git commit -m "Add Inspector findings delivery workflow" && git push -u origin main
+gh repo create YOUR-USERNAME/inspector-findings-demo --private --clone
+cp -r aws-inspector-container-scan-lab/delivery-repo-template/. inspector-findings-demo/
+cd inspector-findings-demo
+git add -A
+git commit -m "Add Inspector findings delivery workflow"
+git push -u origin main
+gh api repos/YOUR-USERNAME/inspector-findings-demo --jq '{owner: .owner.id, repo: .id}'
+cd ../aws-inspector-container-scan-lab
 ```
 
-For an existing repository, copy `.github/workflows/deliver-report.yml` and `scripts/fetch-latest-report.sh` into it and commit. Then record the IDs the trust policy needs, and put them in `terraform.tfvars` alongside `delivery_repo`:
+Keep the two IDs the last command printed. Do not enable branch protection on `main`.
+
+**Checkpoint:** `ls -a ../inspector-findings-demo` shows `.github`, `README.md`, and `scripts`.
+
+### 7b. Create the delivery role and notification topics
+
+1. In `terraform.tfvars`, uncomment the **Delivery** and **Notifications** blocks and fill them in:
+
+   ```hcl
+   delivery_repo             = "YOUR-USERNAME/inspector-findings-demo"
+   delivery_subject_override = ["repo:YOUR-USERNAME@OWNER_ID/inspector-findings-demo@REPO_ID:ref:refs/heads/main"]
+   delivery_notify_emails    = ["readers@example.com"]
+   ops_notify_emails         = ["you@example.com"]
+   ```
+
+2. Apply. Expect 8 to add: the role and its two policies, two topics, two subscriptions, and an alarm.
+
+   ```bash
+   terraform apply
+   ```
+
+3. Each email address receives **AWS Notification - Subscription Confirmation**. Click the link in both.
+
+**Checkpoint:** both rows show a full subscription ARN, not `PendingConfirmation`:
 
 ```bash
-gh api repos/OWNER/REPO --jq '{owner: .owner.id, repo: .id}'
+aws sns list-subscriptions --query 'Subscriptions[?contains(TopicArn, `inspector-lab`)].[Endpoint,SubscriptionArn]' --output table
 ```
 
-```hcl
-delivery_subject_override = ["repo:OWNER@OWNER_ID/REPO@REPO_ID:ref:refs/heads/main"]
+### 7c. Connect the delivery repository to AWS
+
+Six repository variables, all from Terraform outputs:
+
+```bash
+R=YOUR-USERNAME/inspector-findings-demo
+gh variable set AWS_ROLE_ARN       --repo $R --body "$(terraform output -raw delivery_role_arn)"
+gh variable set AWS_REGION         --repo $R --body "$(terraform output -raw aws_region)"
+gh variable set REPORT_BUCKET      --repo $R --body "$(terraform output -raw report_bucket)"
+gh variable set REPORT_PREFIX      --repo $R --body "exports/team-a/"
+gh variable set DELIVERY_TOPIC_ARN --repo $R --body "$(terraform output -raw delivery_topic_arn)"
+gh variable set OPS_TOPIC_ARN      --repo $R --body "$(terraform output -raw ops_topic_arn)"
+gh variable list --repo $R
 ```
 
-The template's README walks through the rest: six repository variables (`AWS_ROLE_ARN`, `AWS_REGION`, `REPORT_BUCKET`, `REPORT_PREFIX`, and the two optional topic ARNs), the cron schedule, and a first manual run. Give the cyber team read access and you are done.
+`REPORT_PREFIX` must match `export_customer` from step 6.
 
-The workflow is short. It assumes the role with `aws-actions/configure-aws-credentials`, runs `scripts/fetch-latest-report.sh`, commits whatever the script wrote, and publishes a notification. The script records every delivered object key in a `.delivered` file, so a scheduled run that finds nothing new changes no files, makes no commit, and sends no email. That makes a daily delivery check harmless even when the export itself runs monthly.
+**Checkpoint:** `gh variable list` shows all six.
 
-### Telling people
+### 7d. Run it
 
-`notifications.tf` adds two SNS topics, each created only when its email list is set:
+Step 6 already put two reports in the bucket. Deliver them:
 
-```hcl
-delivery_notify_emails = ["cyber-team@example.com"]
-ops_notify_emails      = ["cloud-team@example.com"]
+```bash
+gh workflow run deliver-report.yml --repo $R
+gh run watch --repo $R
 ```
 
-The **delivery** topic is for readers. After the workflow commits new reports, it publishes a plain-text message with the customer, the report date, a link to the dated folder, and the file names. The link is built from the workflow's own server and repository, so it is correct on github.com and on GitHub Enterprise Server.
+**Checkpoint:** the run is green, the delivery repository has a new commit by `github-actions[bot]`, and `<customer>-inspector-scans/<date>/` holds the CSV, the JSON, and `SOURCE.txt`. The readers' address has an email with a link to that folder.
 
-The **ops** topic is for the team that runs the pipeline, and it only ever carries bad news. A CloudWatch alarm on the dead-letter queue fires when a scheduled export fails after its retries. A final step in the delivery workflow, guarded by `if: failure()`, publishes the run URL when any earlier step failed. Silence on this topic means every run succeeded, and the readers' silence on an expected day is something you already know about.
+Run it a second time. It finishes green with no commit and no email, because nothing new arrived.
 
-Every subscriber receives a confirmation email from AWS Notifications after the apply and must click the link in it. The delivery role gets `sns:Publish` on exactly these two topics through a second inline policy, so `delivery_role.tf` keeps its read-only shape.
+### 7e. Leave it running
 
-### Why the date can differ from the export time
+The workflow has a daily cron at 12:00 UTC. Edit the `cron` line in `.github/workflows/deliver-report.yml` so it runs at least an hour after your step 6 schedule, in UTC. From here on, every export is delivered and announced without anyone touching it.
 
-The folder date comes from the S3 object's `LastModified` time, which is UTC. An export scheduled for 10:00 PM Central lands under the next day's date. The two formats are also separate reports, so on rare occasions one can finish before midnight UTC and the other after, which puts them in neighboring folders. `SOURCE.txt` in each folder records the report ID and generation time, so nothing is lost.
+The delivery repository's own README explains the folder layout to the readers and repeats this setup for your team.
 
-### What the lab does not do
+## Step 8: Clean up
 
-The template pushes to `main` with the run's own `GITHUB_TOKEN`, so `main` must not be branch-protected in the delivery repository. If your organization requires protection on every repository, add the GitHub Actions app to the ruleset's bypass list, or change the workflow to check out and push a `reports` branch instead.
+1. If you created a suppression rule in step 4, delete it under **Inspector, Suppression rules**. Terraform does not manage it.
+2. Destroy:
+
+   ```bash
+   terraform destroy
+   ```
+
+3. Optionally delete the delivery repository, or keep it as a record:
+
+   ```bash
+   gh repo delete YOUR-USERNAME/inspector-findings-demo
+   ```
+
+**Checkpoint:** `Destroy complete!` The KMS key enters a 7-day deletion window. If you set `manage_inspector = false`, Inspector stays as you found it. If you set `create_github_oidc_provider = false`, the OIDC provider stays too.
+
+The `AWS_ROLE_ARN` variables on both repositories now point at roles that no longer exist. Update them on your next deploy.
 
 ## Troubleshooting
 
-**The workflow fails at the credentials step.** The "Assume the lab IAM role through OIDC" step prints:
-
-```text
-Error: Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity
-```
-
-**Reason.** The role's trust policy did not match the claims in GitHub's OIDC token, most often the `sub` claim. Repositories created after July 15, 2026 send an immutable `sub` that includes numeric owner and repository IDs:
-
-```text
-repo:OWNER/REPO:ref:refs/heads/main                       (older form)
-repo:OWNER@OWNER_ID/REPO@REPO_ID:ref:refs/heads/main      (immutable form)
-```
-
-A policy written for the older form never matches the new one. Set `github_owner_id` and `github_repo_id` in `terraform.tfvars` and apply. GitHub explains the change in its [changelog](https://github.blog/changelog/2026-04-23-immutable-subject-claims-for-github-actions-oidc-tokens). Also rule out a missing `permissions: id-token: write`, a run from a branch other than `github_branch`, and a provider audience that lacks `sts.amazonaws.com`.
-
-**Troubleshooting step.** Add this step to the workflow just before the credentials step. It prints selected claims only. Never print the token itself, because anyone who sees it in a log can replay it until it expires. Compare the printed `sub` with the `sub` condition on the role, then remove the step.
+**A workflow fails at "Assume the ... role through OIDC" with `Not authorized to perform sts:AssumeRoleWithWebIdentity`.** The role's trust policy did not match the token's `sub` claim. Repositories created after July 15, 2026 send `repo:OWNER@OWNER_ID/REPO@REPO_ID:ref:refs/heads/main`. Set the IDs (`github_owner_id` and `github_repo_id` for the lab repo, `delivery_subject_override` for the delivery repo) and apply. To see the real `sub`, add this step before the credentials step, run once, then remove it:
 
 ```yaml
       - name: Debug OIDC claims (temporary)
@@ -421,44 +336,57 @@ A policy written for the older form never matches the new one. Set `github_owner
           PY
 ```
 
-**The credentials step fails with `Input required and not supplied: aws-region`.** The workflow read an empty repository variable. Add `AWS_REGION` and `AWS_ROLE_ARN` under **Settings**, **Secrets and variables**, **Actions**, **Variables**, at repository level. A variable set under an environment is invisible to a job that does not declare that environment.
+It prints claims only, never the token.
 
-![GitHub Actions log showing Input required and not supplied: aws-region on the Assume the lab IAM role step](docs/images/github-actions-missing-region.png)
+**`Input required and not supplied: aws-region`.** A repository variable is missing or was set under an environment instead of at repository level. Re-run the `gh variable set` commands for that repository.
 
-The lab run hit this error first and the trust policy error next. The run list shows four failures, then a green run.
+**`EntityAlreadyExists` for the OIDC provider.** Set `create_github_oidc_provider = false`.
 
-![GitHub Actions run list showing four failed runs followed by a successful run](docs/images/github-actions-run-history.png)
+**Inspector is already enabled.** Set `manage_inspector = false`.
 
-**`EntityAlreadyExists` for the OIDC provider.** Your account already has one. Set `create_github_oidc_provider = false`.
+**No findings after ten minutes.** Check `list-coverage` in step 3. `UNSUPPORTED_OS` means the image's operating system is not scannable. `PENDING_INITIAL_SCAN` means keep waiting.
 
-**Inspector or scanning is already enabled.** Set `manage_inspector = false`.
+**The suppression rule did not change the count.** Inspector applies rules in the background. Refresh after a minute.
 
-**No findings appear.** Wait a few minutes after the push. Confirm the image is on a supported operating system and that registry scanning is set to enhanced.
+**The findings table shows `200+`.** The console caps the count. Filter by severity for an exact number.
 
-**The suppression rule did not change the count right away.** Inspector applies rules in the background and can take a few minutes. Refresh the page. While it runs, you may see partial counts, and Active plus Suppressed should still add up to the original total.
+**No report after a scheduled export.** Read the dead-letter queue (step 6). An empty queue plus no file usually means the schedule time was in the past when you applied.
 
-**The findings table shows `200+`.** The console caps its count. Add a severity filter, or use the Summary page or the **By container repository** tab for totals.
+**The delivery workflow is green but no email arrived.** Check `aws sns list-subscriptions` (step 7b) for `PendingConfirmation`, and check that `DELIVERY_TOPIC_ARN` is set on the delivery repository.
 
 ## GovCloud notes
 
-The Terraform code builds ARNs with the partition lookup, so it works with `arn:aws-us-gov`. Confirm that each service is available in your GovCloud region before you deploy, and check that Inspector's endpoints and the report export behave the same way in your environment.
+ARNs use the partition lookup, so the code works with `arn:aws-us-gov`. Confirm each service is available in your region. On GitHub Enterprise Server, set `delivery_oidc_url` to `https://YOUR-GHES-HOST/_services/token`, and the OIDC provider for that URL must already exist in the account.
 
-## Clean up
+## Repository layout
 
-Destroy the lab when you finish so the trial and charges stop. Save any screenshots you want first.
-
-1. If you created a suppression rule in step 4, delete it under **Inspector, Suppression rules**. Terraform does not manage it, so `terraform destroy` will not remove it.
-2. Run:
-
-   ```bash
-   terraform destroy
-   ```
-
-This removes the repositories (including images), the report bucket and its contents, and the schedule. The KMS key is scheduled for deletion after a 7-day waiting period. If you set `manage_inspector = true`, Terraform also disables Inspector scanning for ECR in the account. If you set it to `false`, Terraform leaves Inspector as it found it.
-
-3. If you used the GitHub Actions option, the `AWS_ROLE_ARN` repository variable now points to a role that no longer exists. Delete the variable, or leave it for the next time you deploy and update it with the new role ARN.
-
-If you set `create_github_oidc_provider = false`, the existing GitHub OIDC provider stays in the account because Terraform never created it.
+```
+.
+├── providers.tf              AWS provider and shared lookups
+├── variables.tf              Core inputs
+├── inspector.tf              Enables Inspector and sets ECR scanning
+├── ecr.tf                    The two lab repositories
+├── storage.tf                KMS key and report bucket
+├── github_oidc.tf            OIDC role for the push workflow (step 2, option B)
+├── scheduled_export.tf       Scheduled export, one schedule per format (step 6)
+├── delivery_role.tf          Read-only role for the delivery workflow (step 7)
+├── notifications.tf          SNS topics and dead-letter queue alarm (step 7)
+├── outputs.tf
+├── terraform.tfvars.example  Every variable, grouped by step. Copy to terraform.tfvars
+├── delivery-repo-template/   Contents of the delivery repository (step 7)
+│   ├── README.md
+│   ├── scripts/fetch-latest-report.sh
+│   └── .github/workflows/deliver-report.yml
+├── scripts/
+│   ├── push-images.sh        Step 2, option A
+│   └── export-report.sh      Step 5, CLI version
+├── .github/workflows/
+│   ├── push-images.yml       Step 2, option B
+│   └── export-report.yml     Step 5, Actions version
+└── docs/
+    ├── how-it-works.md       Design, IAM policies, console tour, and the lab's numbers
+    └── images/
+```
 
 ## License
 
