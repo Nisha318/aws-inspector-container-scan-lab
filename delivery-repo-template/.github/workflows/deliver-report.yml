@@ -72,6 +72,23 @@ jobs:
           REPORT_PREFIX: ${{ vars.REPORT_PREFIX }}
         run: bash scripts/fetch-latest-report.sh
 
+      # One SUMMARY.md per dated folder that received a JSON report this run:
+      # findings grouped by repository and package, ranked into tiers, and
+      # compared with the previous report via <customer>-inspector-scans/summary.json.
+      - name: Summarize the findings
+        id: summarize
+        if: steps.fetch.outputs.delivered != '0'
+        env:
+          FOLDERS: ${{ steps.fetch.outputs.folders }}
+        run: |
+          for d in $FOLDERS; do
+            if ls "$d"/*.json >/dev/null 2>&1; then
+              python3 scripts/summarize.py "$d"
+            else
+              echo "No JSON report in $d, skipping summary."
+            fi
+          done
+
       - name: Commit and push new reports
         run: |
           git config user.name "github-actions[bot]"
@@ -95,10 +112,17 @@ jobs:
           FOLDERS: ${{ steps.fetch.outputs.folders }}
           FILES: ${{ steps.fetch.outputs.files }}
           BASE_URL: ${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}
+          BLOB_URL: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}
+          P1: ${{ steps.summarize.outputs.p1 }}
+          NEW: ${{ steps.summarize.outputs.new }}
+          RESOLVED: ${{ steps.summarize.outputs.resolved }}
+          ROWS: ${{ steps.summarize.outputs.rows }}
         run: |
           links=""
+          summary=""
           for d in $FOLDERS; do
             links="${links}  ${BASE_URL}/${d}"$'\n'
+            [ -f "$d/SUMMARY.md" ] && summary="${BLOB_URL}/${d}/SUMMARY.md"
           done
           report_date="${FOLDERS##* }"; report_date="${report_date##*/}"
           count=$(printf '%s\n' $FILES | wc -l)
@@ -107,12 +131,19 @@ jobs:
           else
             note="Only one format arrived this run. If a second format was expected, its export may have failed and the operators have been told."
           fi
+          headline=""
+          if [ -n "$summary" ]; then
+            headline="Summary:      ${ROWS} rows, ${P1} need attention now, ${NEW} new, ${RESOLVED} resolved
+          ${summary}
+          "
+          fi
           subject="Inspector findings delivered: ${CUSTOMER}, ${report_date}"
+          [ -n "$P1" ] && [ "$P1" != "0" ] && subject="${subject} (${P1} to act on)"
           message="New Amazon Inspector container scan reports were delivered.
 
           Customer:     ${CUSTOMER}
           Report date:  ${report_date}
-
+          ${headline}
           Folder:
           ${links}
           Files:

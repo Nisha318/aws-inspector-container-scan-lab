@@ -215,7 +215,7 @@ Set `export_schedule = ""` to remove everything this step created.
 
 ## Step 7: Deliver the reports to a GitHub repository
 
-Goal: a second, private repository that the readers can open. A workflow in it pulls each new report from S3 and commits it under `<customer>-inspector-scans/<date>/`, then emails the readers a link.
+Goal: a second, private repository that the readers can open. A workflow in it pulls each new report from S3, commits it under `<customer>-inspector-scans/<date>/` with a ranked `SUMMARY.md`, then emails the readers a link.
 
 ### 7a. Create the delivery repository
 
@@ -289,7 +289,9 @@ gh workflow run deliver-report.yml --repo $R
 gh run watch --repo $R
 ```
 
-**Checkpoint:** the run is green, the delivery repository has a new commit by `github-actions[bot]`, and `<customer>-inspector-scans/<date>/` holds the CSV, the JSON, and `SOURCE.txt`. The readers' address has an email with a link to that folder.
+**Checkpoint:** the run is green, the delivery repository has a new commit by `github-actions[bot]`, and `<customer>-inspector-scans/<date>/` holds `SUMMARY.md`, the CSV, the JSON, and `SOURCE.txt`. The readers' address has an email with the headline counts and links to the summary and the folder.
+
+Open `SUMMARY.md` on GitHub. It groups the findings into one row per repository and package, ranked into four tiers, with the worst CVE, score, EPSS, fixed-in version, and whether the row is new or carried over from the last report.
 
 Run it a second time. It finishes green with no commit and no email, because nothing new arrived.
 
@@ -376,6 +378,7 @@ ARNs use the partition lookup, so the code works with `arn:aws-us-gov`. Confirm 
 ├── delivery-repo-template/   Contents of the delivery repository (step 7)
 │   ├── README.md
 │   ├── scripts/fetch-latest-report.sh
+│   ├── scripts/summarize.py
 │   └── .github/workflows/deliver-report.yml
 ├── scripts/
 │   ├── push-images.sh        Step 2, option A

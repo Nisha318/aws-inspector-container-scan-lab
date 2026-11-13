@@ -172,6 +172,20 @@ Workflow logs on a public repository are public. Both lab workflows pass `mask-a
 
 ![GitHub Actions run list showing four failed runs followed by a successful run](images/github-actions-run-history.png)
 
+## The summary
+
+A raw report of 566 findings is a spreadsheet, not a plan. `scripts/summarize.py` turns it into `SUMMARY.md` beside the raw files.
+
+**One row per repository and package.** Inspector reports one finding per CVE per image, so one old `openssl` produces forty rows. Nobody fixes a CVE. They update the package, usually by rebuilding on a newer base image, and that closes every CVE on it at once. So the summary's unit of work is the package in a repository, with the tags listed in the row. In the lab, 566 findings become 63 rows.
+
+**Four tiers.** The row's worst severity, whether any CVE on it has a known exploit, and whether a fix exists decide the tier. P1 is known exploit plus fix available plus critical or high: there is a patch and someone is using the hole. P2 is the same without a known exploit. P3 is fix available at medium or low. P4 is no fix yet, which is a risk decision rather than a patching task. Within a tier, rows sort by the highest Inspector score, then the highest EPSS, which is FIRST's estimate of the probability a CVE is exploited in the next 30 days.
+
+**New, carried, resolved.** The script keeps `summary.json` in the scan folder: for every row ever seen, when it first appeared and how many reports it has been in. A row marked Carried (6) has been ignored for six reports, which is a different conversation from one that appeared today. Rows that vanish since the previous report are listed as Resolved. Running the script twice on the same folder is safe.
+
+**Platform end of life.** Inspector reports an unsupported base OS as a finding of its own. The lab hit this on its second day: Debian 11 had left Inspector's supported list, so both images carried a "Platform End Of Life" finding. The summary pulls that out into a notice at the top, because it changes the advice for every other row. Vendor patches have stopped, so the real fix is a newer base image, not a package bump.
+
+**What it does not know.** Whether an image is deployed, exposed, or owned by anyone. That context lives in ECS or EKS, not in the registry, and would be the next thing to join.
+
 ## What comes next
 
-The reports now arrive on their own. The next phase ranks and deduplicates the findings into a `SUMMARY.md` beside the raw files, one row per resource and package, worst first, with what changed since the last run, and opens one GitHub Issue per row so the work is tracked where the reports already live.
+One GitHub Issue per P1 or P2 row, opened and closed by the workflow as rows appear and resolve, so the work is tracked where the reports already live.

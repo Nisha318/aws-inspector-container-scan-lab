@@ -9,17 +9,30 @@ Reports are filed by the date they were generated, in UTC:
 ```
 team-a-inspector-scans/
 ├── .delivered                      Bookkeeping for the workflow. Ignore it.
+├── summary.json                    Bookkeeping for the summaries. Ignore it.
 ├── 2026-11-10/
-│   ├── findings-<report id>.csv    Open in a spreadsheet
-│   ├── findings-<report id>.json   For scripts and tooling
+│   ├── SUMMARY.md                  Start here
+│   ├── findings-<report id>.csv    Every finding, for a spreadsheet
+│   ├── findings-<report id>.json   Every finding, for tooling
 │   └── SOURCE.txt                  Where each file came from and when
 └── 2026-12-10/
     └── ...
 ```
 
-Each report lists active findings for the customer's container images at the time it was generated. Suppressed findings are left out. Both files in a folder come from the same scan and differ only in format.
+**Start with `SUMMARY.md`.** It groups the findings into one row per repository and package, since updating a package closes every CVE on it, and sorts the rows into four tiers:
 
-When new reports land, subscribers receive an email with a link to the dated folder. No email means nothing new was delivered.
+| Tier | Meaning |
+| --- | --- |
+| P1, act now | Known exploit, fix available, critical or high severity |
+| P2, schedule | Fix available, critical or high, no known exploit |
+| P3, track | Fix available, medium or low |
+| P4, accept or wait | No fix available yet |
+
+Each row shows the current and fixed-in versions, how many CVEs it covers, the worst one with a link, the Inspector score, the EPSS exploitation probability, when it was first seen, and whether it is new or has been carried over from earlier reports. A **Resolved** section lists rows that disappeared since the last report. If the base operating system of an image is past end of life, a notice at the top says so, because package updates alone will not close those rows.
+
+The CSV and JSON hold every finding in full. Suppressed findings are not in any of the files. The findings come from registry scans, so nothing here says whether an image is deployed or exposed.
+
+When new reports land, subscribers receive an email with the headline counts and links to the summary and the folder. No email means nothing new was delivered.
 
 If the export and the delivery job ever fall on opposite sides of midnight UTC, a folder can hold a single file and the next folder its pair. `SOURCE.txt` records the report ID and generation time for each file, so the pairing is always recoverable.
 
@@ -46,11 +59,12 @@ git commit -m "Add Inspector findings delivery workflow"
 git push -u origin main
 ```
 
-**Existing repository.** Copy these two paths into it, keeping their names, and commit:
+**Existing repository.** Copy these three paths into it, keeping their names, and commit:
 
 ```
 .github/workflows/deliver-report.yml
 scripts/fetch-latest-report.sh
+scripts/summarize.py
 ```
 
 This README is optional. Replace it with one that names the customer, or keep the "For readers" section above.
